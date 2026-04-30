@@ -1,0 +1,50 @@
+# Don't send these to Docker build context
+venv/
+.env
+__pycache__/
+*.pyc
+.git/
+.gitignore
+.gemini/
+.dockerignore
+
+# Test and debug files
+test_*.py
+debug*.py
+fix_*.py
+check_*.py
+get_lines*.py
+get_lines*.txt
+get_tail*
+tmp_lines.txt
+compile_err.txt
+search_outbound.txt
+old_instructions.txt
+
+# Backup files
+*.zip
+*.wav
+
+# One-off scripts
+benchmark_*.py
+optimize_*.py
+restore_*.py
+find_invalid.py
+fetch_azure_voices.py
+generate_audio.py
+setup_vobiz_trunks.py
+create_agent_tables.py
+
+# Trigger scripts (not needed in cloud — calls triggered via API)
+call_trigger.py
+batch_call.py
+batch_call_trigger.py
+batch_call_campaign.py
+
+# Docs
+*.md
+agent_sig.txt
+whatsapp_integration_guide.md
+
+# Nested directory (if exists)
+hookfish voice agent/

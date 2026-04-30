@@ -1,0 +1,75 @@
+# Render.com Blueprint — Hookfish Platform
+# Deploy both the Dashboard API and the Voice Agent
+
+services:
+  # ── 1. Dashboard API (FastAPI) ─────────────────────────────
+  - type: web
+    name: hookfish-api
+    runtime: python
+    region: singapore
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn api.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: DB_HOST
+        sync: false
+      - key: DB_PORT
+        sync: false
+      - key: DB_NAME
+        sync: false
+      - key: DB_USER
+        sync: false
+      - key: DB_PASSWORD
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: LIVEKIT_URL
+        sync: false
+      - key: LIVEKIT_API_KEY
+        sync: false
+      - key: LIVEKIT_API_SECRET
+        sync: false
+      - key: CEREBRAS_API_KEY
+        sync: false
+      - key: deepgram_API_KEY
+        sync: false
+      - key: SMALLEST_API_KEY
+        sync: false
+      - key: TRUNK_ID
+        sync: false
+
+  # ── 2. Voice Agent (Background Worker) ─────────────────────
+  # Uncomment when ready to deploy the voice agent:
+  # - type: worker
+  #   name: hookfish-voice-agent
+  #   runtime: docker
+  #   region: singapore
+  #   plan: starter  # Workers need at least starter plan
+  #   dockerfilePath: ./Dockerfile
+  #   envVars:
+  #     - key: LIVEKIT_URL
+  #       sync: false
+  #     - key: LIVEKIT_API_KEY
+  #       sync: false
+  #     - key: LIVEKIT_API_SECRET
+  #       sync: false
+  #     - key: DB_HOST
+  #       sync: false
+  #     - key: DB_PORT
+  #       sync: false
+  #     - key: DB_NAME
+  #       sync: false
+  #     - key: DB_USER
+  #       sync: false
+  #     - key: DB_PASSWORD
+  #       sync: false
+  #     - key: CEREBRAS_API_KEY
+  #       sync: false
+  #     - key: deepgram_API_KEY
+  #       sync: false
+  #     - key: SMALLEST_API_KEY
+  #       sync: false
+  #     - key: TRUNK_ID
+  #       sync: false
