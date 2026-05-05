@@ -47,7 +47,7 @@ from db_helper import (
 )
 
 from google_calendar import schedule_meeting_on_calendar, parse_meeting_datetime
-from whatsapp_helper import send_and_log_meeting_details, send_and_log_project_details
+
 
 # Load environment variables
 load_dotenv()
@@ -246,14 +246,14 @@ Follow this exact sequence and wording to sound highly natural and human:
    - Area/Size? -> "Two BHK के लिए six hundred four और six hundred nineteen square feet RERA carpet area के options available हैं. आपको कौन सा size suit करेगा?"
    - Price? -> [CRITICAL: Say EXACTLY this price. Do NOT change the numbers.] "अच्छा तो price बताती हूँ. छोटे two BHK की price है two point fifty seven crore all inclusive. और बड़े वाले की two point sixty seven crore all inclusive. All inclusive means agreement value plus stamp duty six percent plus GST five percent plus other charges सब included है. तो basically under three crore में South Bombay में two BHK मिल रहा है."
    - Payment plan? -> "अभी सिर्फ fifty lakh देना है own funds या bank financing से. उसके बाद possession तक कोई payment नहीं. आप stamp duty और GST pay करके property register भी करा सकते हैं जिससे risk और कम हो जाता है. क्या आप site visit करना चाहेंगे?"
-   - Exact Location? -> "माहिम West में है, Jimmy Boy Bakery के opposite, Bank Of Baroda landmark, Desai Park. Railway station और Shitla Devi Metro Station walking distance पर हैं. Location बहुत बड़ा advantage है. मैं आपको WhatsApp पर location pin भेज दूँगी."
+   - Exact Location? -> "माहिम West में है, Jimmy Boy Bakery के opposite, Bank Of Baroda landmark, Desai Park. Railway station और Shitla Devi Metro Station walking distance पर हैं. Location बहुत बड़ा advantage है. मैं आपको location details share कर दूँगी."
    - Who is the developer? -> "Viyan Ventures ने develop किया है. Mr. Nayan Gandhi और Mr. Rohan Jain दोनो directors हैं. Western Mumbai production.. Goregaon Malad में काफ़ी experience है. ये उनका South Bombay का first project है माहिम West में."
    - Which floors available? -> "Thirteenth floor और ऊपर के apartments available हैं new buyers के लिए. Below thirteenth floor old society members को दिए गए हैं. ये एक redevelopment project है."
    - Construction quality? -> "Miven Technology से बन रहा है जो fast floor slab casting के लिए use होती है. Already eleventh slab complete है. BMC से CC eighteenth floor तक मिल चुका है. Nineteen to twenty two floor का CC process में है."
 
 6. CLOSING & SCHEDULING:
    - INTERESTED -> ask date/time -> schedule_meeting
-   - MAYBE -> offer WhatsApp details -> schedule_callback
+   - MAYBE -> offer project details -> schedule_callback
    - NOT INTERESTED -> ask concern -> address briefly -> end_call
 --- END BUYER FLOW ---
 """
@@ -293,7 +293,7 @@ Follow this exact sequence and wording to sound highly natural and expressive:
 6. BROKER QUALIFICATION & SCHEDULING:
    Ask: "आप currently किस area में काम कर रहे हैं?"
    - INTERESTED -> ask date/time -> schedule_meeting
-   - MAYBE -> "कोई बात नहीं. मैं आपको complete project details WhatsApp पर भेज दूँगी. कब call back करूँ?" -> schedule_callback
+   - MAYBE -> "कोई बात नहीं. मैं आपको complete project details share कर दूँगी. कब call back करूँ?" -> schedule_callback
    - NOT_INTERESTED -> "समझ गई. अगर बुरा ना मानें, specifically किस वजह से?" -> wait for answer -> end_call
 --- END BROKER FLOW ---
 """
@@ -957,91 +957,7 @@ async def entrypoint(ctx: JobContext):
         # Return minimal silent response — agent must NOT read this aloud
         return "[SILENT] Done."
 
-    # ---- WhatsApp Tool: Send details on demand ----
 
-    @function_tool(
-        name="send_whatsapp_details",
-        description=(
-            "Send meeting details or project brochure info to the contact via WhatsApp. "
-            "Use this when the contact says 'send me details on WhatsApp', "
-            "'WhatsApp kar do', 'details bhej do', etc. "
-            "Also used automatically after scheduling a meeting."
-        )
-    )
-    async def send_whatsapp_details(
-        message_type: str | None = "project_details",
-        project_name: str | None = None,
-        project_location: str | None = None,
-        price_info: str | None = None,
-        notes: str | None = None,
-    ) -> str:
-        """Send meeting or project details to the contact via WhatsApp.
-
-        Args:
-            message_type: What to send - 'project_details' or 'meeting_confirmation'
-            project_name: Name of the project/property
-            project_location: Location of the project
-            price_info: Price or payment plan info
-            notes: Any additional notes to include
-        """
-        logger.info(f"send_whatsapp_details invoked. Phone: {phone_number}, Type: {message_type}")
-
-        if not phone_number:
-            return "Cannot send WhatsApp: no phone number available for this call."
-
-        # Get the caller name
-        wa_caller_name = caller_name_override
-        if not wa_caller_name and phone_number:
-            customer = lookup_customer_by_phone(phone_number)
-            if customer:
-                wa_caller_name = customer.get("name", "Customer")
-        wa_caller_name = wa_caller_name or "Customer"
-
-        try:
-            if message_type == "project_details":
-                result = send_and_log_project_details(
-                    to_phone=phone_number,
-                    contact_name=wa_caller_name,
-                    project_name=project_name or "Maanikya",
-                    project_location=project_location or "Opposite Jimmy Boy Bakery, Desai Park, माहिम West, South Bombay",
-                    project_type="Residential - 2 BHK (Redevelopment)",
-                    key_highlights=[
-                        "South Bombay prime location - Mahim West",
-                        "Walking distance to Railway Station & Shitla Devi Metro Station",
-                        "Developed by Viyan Ventures (Mr. Nayan Gandhi & Mr. Rohan Jain)",
-                        "Pay 50 lakh now, no further payments until possession",
-                        "11th slab complete out of 23 (Miven Technology)",
-                        "BMC CC received up to 18th floor",
-                        "13th floor & above available for new buyers",
-                        "2BHK (604 sqft) - 2.57 Cr | 2BHK (619 sqft) - 2.67 Cr (All-inclusive)",
-                        "RERA Possession: 2029",
-                    ],
-                    price_info=price_info or "2BHK 604sqft: 2.57Cr | 2BHK 619sqft: 2.67Cr (All-inclusive). Pay 50L now, rest at possession.",
-                    contact_type=contact_type,
-                    call_log_id=call_log_id,
-                )
-            else:
-                result = send_and_log_meeting_details(
-                    to_phone=phone_number,
-                    contact_name=wa_caller_name,
-                    meeting_type="site_visit",
-                    meeting_date="TBD",
-                    meeting_time="TBD",
-                    project_name=project_name,
-                    notes=notes,
-                    call_log_id=call_log_id,
-                )
-
-            if result.get("success"):
-                logger.info(f"WhatsApp details sent to {phone_number}")
-                return "[SILENT] Done."
-            else:
-                logger.warning(f"WhatsApp send failed: {result.get('message')}")
-                return "[SILENT] Done."
-
-        except Exception as e:
-            logger.error(f"Error in send_whatsapp_details: {e}")
-            return "[SILENT] Done."
 
     # ---- Create Agent Session ----
     session = AgentSession(

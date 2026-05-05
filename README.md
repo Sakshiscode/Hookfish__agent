@@ -5,7 +5,7 @@ Hookfish is a high-performance, low-latency AI voice agent platform designed for
 ## 🚀 Features
 - **Low Latency**: Near-human response times (sub-1s).
 - **Hinglish Support**: Natural Indian English and Hindi conversation.
-- **Multimodal Integration**: WhatsApp follow-ups, Google Calendar scheduling, and CRM logging.
+- **Multimodal Integration**: Google Calendar scheduling and CRM logging.
 - **Batch Campaigns**: Trigger multiple calls in parallel.
 
 ---

@@ -23,7 +23,7 @@ graph TD
     E -->|STT| F[Deepgram]
     E -->|LLM| G[Azure OpenAI / Groq]
     E -->|TTS| H[Smallest AI / Azure]
-    E -->|Actions| I[WhatsApp / Google Calendar]
+    E -->|Actions| I[Google Calendar]
 ```
 
 ---
@@ -46,11 +46,11 @@ graph TD
 - Includes logic for:
     - **Hinglish** support (via specific TTS models).
     - **Interruption** handling.
-    - **Function Calling**: Scheduling meetings (Google Calendar) and sending summaries (WhatsApp).
+    - **Function Calling**: Scheduling meetings (Google Calendar).
 
 ### Integration Helpers
 - **`db_helper.py`**: All SQL interactions. Optimized for high-concurrency voice sessions.
-- **`whatsapp_helper.py`**: Integrates with Meta Cloud API to send follow-up templates.
+
 - **`google_calendar.py`**: Manages OAuth and event creation for scheduling.
 
 ---
@@ -65,7 +65,7 @@ The project relies on several specialized providers. All credentials should be i
 | **STT** | Voice to Text | Deepgram |
 | **TTS** | Text to Voice (Hinglish) | Smallest AI / Azure Speech |
 | **Database** | Persistence | Aiven MySQL |
-| **WhatsApp** | Follow-up notifications | Meta Cloud API |
+
 | **Telephony** | SIP Trunks / Phone Numbers | Vobiz |
 
 ---
@@ -100,7 +100,7 @@ Before running a full call, verify individual services:
 - **Database**: `python test_db_connection.py`
 - **TTS**: `python test_smallest_tts.py`
 - **LLM**: `python test_groq.py`
-- **WhatsApp**: `python whatsapp_helper.py` (has built-in test case)
+
 
 ---
 
