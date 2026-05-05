@@ -22,28 +22,8 @@ load_dotenv()
 os.environ["NO_PROXY"] = "*"
 os.environ["HTTPX_NO_PROXIES"] = "1"
 
-from db_helper import (
-    lookup_customer_by_phone,
-    lookup_lead_by_phone,
-    lookup_property_by_name,
-    save_call_conversation,
-    update_lead_status,
-    save_call_outcome,
-    get_project_details_for_lead,
-    # New imports for agent flow
-    is_dnc,
-    mark_dnc as db_mark_dnc,
-    create_call_log,
-    update_call_log,
-    save_call_transcript,
-    check_call_allowed,
-    record_call_attempt,
-    allocate_manager,
-    create_meeting,
-    get_meetings_for_phone,
-    update_meeting_calendar,
-    get_manager_email,
     get_connection,
+    get_agent_context_optimized,
 )
 
 from google_calendar import schedule_meeting_on_calendar, parse_meeting_datetime
@@ -69,83 +49,64 @@ CONTACT_TYPE_BROKER = "broker"
 # ============================================================
 # Database Context Builder
 # ============================================================
-def build_context_from_db(phone_number: str) -> str:
+def build_context_from_db(phone_number: str, pre_fetched_data: dict = None) -> str:
     """
-    Query the database for all info related to a phone number
-    and build a context string the agent can use in conversation.
-    Now includes project/property details and meeting history.
+    Build a context string from DB data.
+    Uses pre_fetched_data if provided to avoid new DB calls.
     """
     context_parts = []
     
-    try:
-        conn = get_connection()
-    except Exception as e:
-        logger.error(f"Failed to connect to DB in build_context: {e}")
-        return f"No previous information found for this number ({phone_number})."
+    if pre_fetched_data:
+        data = pre_fetched_data
+    else:
+        # Fallback to slow fetch if no pre-fetched data
+        data = get_agent_context_optimized(phone_number)
 
-    try:
-        # 1. Look up customer
-        customer = lookup_customer_by_phone(phone_number, conn=conn)
-        if customer:
-            context_parts.append(
-                f"Customer Info: Name = {customer['name']}, "
-                f"ID = {customer['id']}, Source = {customer.get('origin', 'N/A')}"
-            )
-
-        # 2. Look up leads associated with this phone
-        leads = lookup_lead_by_phone(phone_number, conn=conn)
-        if leads:
-            context_parts.append(f"\nFound {len(leads)} leads for this number:")
-            for lead in leads:
-                lead_info = (
-                    f"  - Lead #{lead['id']}: Customer = {lead['customer_name']}, "
-                    f"Property = {lead['property_name']}, Status = {lead['status']}"
-                )
-                if lead.get('notes'):
-                    lead_info += f", Notes = {lead['notes']}"
-                if lead.get('followup'):
-                    lead_info += f", Follow-up = {lead['followup']}"
-                context_parts.append(lead_info)
-
-        # 3. Look up project/property details
-        projects = get_project_details_for_lead(phone_number, conn=conn)
-        if projects:
-            context_parts.append(f"\nRelated Project/Property Details:")
-            for proj in projects:
-                proj_info = f"  - {proj['name']}"
-                if proj.get('type'):
-                    proj_info += f" (Type: {proj['type']})"
-                if proj.get('alias'):
-                    proj_info += f" | Alias: {proj['alias']}"
-                if proj.get('commission_percentage'):
-                    proj_info += f" | Commission: {proj['commission_percentage']}%"
-                if proj.get('site_visit_bonus'):
-                    proj_info += f" | Site Visit Bonus: {proj['site_visit_bonus']}"
-                if proj.get('guarantee_for_sale'):
-                    proj_info += f" | Guarantee: {proj['guarantee_for_sale']}"
-                context_parts.append(proj_info)
-
-        # 4. Check for past meetings
-        meetings = get_meetings_for_phone(phone_number, conn=conn)
-        if meetings:
-            context_parts.append(f"\nPast Meetings/Appointments:")
-            for mtg in meetings:
-                mtg_info = f"  - {mtg['meeting_type']}: {mtg.get('meeting_date', 'TBD')}"
-                if mtg.get('project_name'):
-                    mtg_info += f" | Project: {mtg['project_name']}"
-                if mtg.get('manager_name'):
-                    mtg_info += f" | Manager: {mtg['manager_name']}"
-                mtg_info += f" | Status: {mtg['status']}"
-                context_parts.append(mtg_info)
-    finally:
-        conn.close()
-
-    if not context_parts:
+    # 1. Customer
+    customer = data.get("customer")
+    if customer:
         context_parts.append(
-            f"No previous information found for this number ({phone_number}). This may be a new contact."
+            f"Customer Info: Name = {customer['name']}, "
+            f"ID = {customer['id']}, Source = {customer.get('origin', 'N/A')}"
         )
 
+    # 2. Leads
+    leads = data.get("leads", [])
+    if leads:
+        context_parts.append(f"\nFound {len(leads)} leads for this number:")
+        for lead in leads:
+            lead_info = (
+                f"  - Lead #{lead['id']}: Customer = {lead['customer_name']}, "
+                f"Property = {lead['property_name']}, Status = {lead['status']}"
+            )
+            if lead.get('notes'): lead_info += f", Notes = {lead['notes']}"
+            if lead.get('followup'): lead_info += f", Follow-up = {lead['followup']}"
+            context_parts.append(lead_info)
+
+    # 3. Projects
+    projects = data.get("projects", [])
+    if projects:
+        context_parts.append(f"\nRelated Project/Property Details:")
+        for proj in projects:
+            proj_info = f"  - {proj['name']}"
+            if proj.get('type'): proj_info += f" (Type: {proj['type']})"
+            if proj.get('alias'): proj_info += f" | Alias: {proj['alias']}"
+            if proj.get('commission_percentage'): proj_info += f" | Commission: {proj['commission_percentage']}%"
+            context_parts.append(proj_info)
+
+    # 4. Meetings
+    meetings = data.get("meetings", [])
+    if meetings:
+        context_parts.append(f"\nPast Meetings/Appointments:")
+        for mtg in meetings:
+            mtg_info = f"  - {mtg['meeting_type']}: {mtg.get('meeting_date', 'TBD')} | Status: {mtg['status']}"
+            context_parts.append(mtg_info)
+
+    if not context_parts:
+        context_parts.append(f"No previous information found for this number ({phone_number}).")
+
     return "\n".join(context_parts)
+
 
 
 # ============================================================
@@ -314,35 +275,38 @@ Start the call like this:
 def build_agent_instructions(is_outbound: bool = False, phone_number: str = None,
                              contact_type: str = CONTACT_TYPE_BUYER,
                              caller_name_override: str = None,
-                             target_project: str = None) -> str:
-    """Synchronously hits the DB to build the dynamic instructions string."""
-    # Build dynamic instructions with DB context
+                             target_project: str = None,
+                             pre_fetched_data: dict = None) -> str:
+    """Synchronously builds the instructions string using pre-fetched data."""
     caller_name = "Sir/Ma'am"
     db_context = ""
 
     if phone_number:
-        logger.info(f"Looking up database for phone: {phone_number}")
-        db_context = build_context_from_db(phone_number)
-        logger.info(f"DB context loaded:\n{db_context}")
-
-        # Try to extract name from customer or lead data
-        customer = lookup_customer_by_phone(phone_number)
-        if customer and customer.get("name"):
-            caller_name = customer["name"].strip()
+        # 1. Context from DB
+        db_context = build_context_from_db(phone_number, pre_fetched_data=pre_fetched_data)
+        
+        # 2. Resolve Name (use pre-fetched if available)
+        if pre_fetched_data:
+            customer = pre_fetched_data.get("customer")
+            if customer and customer.get("name"):
+                caller_name = customer["name"].strip()
+            else:
+                leads = pre_fetched_data.get("leads", [])
+                if leads and leads[0].get("partner_name"):
+                    caller_name = leads[0]["partner_name"].strip()
         else:
-            leads = lookup_lead_by_phone(phone_number)
-            if leads and leads[0].get("partner_name"):
-                caller_name = leads[0]["partner_name"].strip()
+            # Slow fallback
+            customer = lookup_customer_by_phone(phone_number)
+            if customer and customer.get("name"):
+                caller_name = customer["name"].strip()
 
-    # Override with explicit name if provided
+    # Override name
     if caller_name_override:
         caller_name = caller_name_override
-        logger.info(f"Using caller name override: {caller_name}")
 
-    # Build instructions based on contact type
+    # Build instructions
     instructions = BASE_INSTRUCTIONS.replace("{caller_name}", caller_name)
 
-    # Add contact-type specific flow
     if not is_outbound:
         instructions += INBOUND_INSTRUCTIONS.replace("{caller_name}", caller_name)
     elif contact_type == CONTACT_TYPE_BROKER:
@@ -351,31 +315,14 @@ def build_agent_instructions(is_outbound: bool = False, phone_number: str = None
         instructions += BUYER_INSTRUCTIONS.replace("{caller_name}", caller_name)
 
     # Add DB context
-    # Check if we have a target project to inject
     if target_project:
-        db_context += f"\n\n*** TARGET PROJECT FOR THIS CALL ***\n"
-        prop_details = lookup_property_by_name(target_project)
-        if prop_details:
-            for p in prop_details:
-                db_context += f"Project Name: {p['name']}\n"
-                if p.get('commission_percentage'): db_context += f"Commission: {p['commission_percentage']}%\n"
-                if p.get('site_visit_bonus'): db_context += f"Site Bonus: {p['site_visit_bonus']}\n"
-        else:
-            db_context += f"Project Name: {target_project}\n"
-        db_context += "STRICT RULE: YOU MUST ONLY PITCH THIS TARGET PROJECT. Do not mention any other project.\n"
+        db_context += f"\n\n*** TARGET PROJECT ***\nProject Name: {target_project}\nSTRICT RULE: YOU MUST ONLY PITCH THIS TARGET PROJECT.\n"
 
     if db_context.strip():
-        instructions += f"""
-
---- DATABASE CONTEXT (for this call) ---
-{db_context.strip()}
----
-Use the above information to personalize the conversation.
-If a TARGET PROJECT is provided, you MUST use it in the PROJECT AWARENESS section instead of the default project.
-If there have been prior leads or interactions, naturally reference them.
-But don't share all information at once -- share as needed.
-"""
+        instructions += f"\n\n--- DATABASE CONTEXT ---\n{db_context.strip()}\n---\n"
+    
     return instructions
+
 
 # ============================================================
 # Voice Agent Class
@@ -502,28 +449,32 @@ async def entrypoint(ctx: JobContext):
         except json.JSONDecodeError:
             pass
 
-    # ---- Pre-call Validation (Section 8.3 + 6.3) ----
+    # ---- Pre-call Optimized Data Fetch ----
+    db_data = {"allowed": True, "reason": "OK"}
+    if phone_number:
+        logger.info(f"Pre-fetching optimized DB data for {phone_number}...")
+        db_data = await asyncio.to_thread(get_agent_context_optimized, phone_number)
+        
+    # ---- Pre-call Validation ----
     if is_outbound and phone_number:
-        # Check if call is allowed (DNC + max 1/day)
-        call_check = check_call_allowed(phone_number)
-        if not call_check["allowed"]:
-            logger.warning(f"Call NOT allowed to {phone_number}: {call_check['reason']}")
-            ctx.shutdown(reason=f"call_blocked: {call_check['reason']}")
+        if not db_data["allowed"]:
+            logger.warning(f"Call NOT allowed to {phone_number}: {db_data['reason']}")
+            ctx.shutdown(reason=f"call_blocked: {db_data['reason']}")
             return
 
-        # Validate that we have a name (Section 8.3: no call without name)
+        # Get name from pre-fetched data
         caller_name = caller_name_override
         if not caller_name:
-            customer = lookup_customer_by_phone(phone_number)
-            if customer and customer.get("name"):
-                caller_name = customer["name"].strip()
+            customer = db_data.get("customer")
+            if customer:
+                caller_name = customer.get("name")
             else:
-                leads = lookup_lead_by_phone(phone_number)
-                if leads and leads[0].get("partner_name"):
-                    caller_name = leads[0]["partner_name"].strip()
+                leads = db_data.get("leads", [])
+                if leads:
+                    caller_name = leads[0].get("partner_name")
 
-        if not caller_name or caller_name == "Sir/Ma'am":
-            logger.info(f"No contact name found for {phone_number} — using default greeting")
+        if not caller_name:
+            caller_name = "Sir/Ma'am"
 
     # ---- Create Call Log ----
     if phone_number:
@@ -535,20 +486,15 @@ async def entrypoint(ctx: JobContext):
             direction="outbound" if is_outbound else "inbound",
             room_name=ctx.room.name,
         )
-        # Record the call attempt
         record_call_attempt(phone_number, result="initiated", call_log_id=call_log_id)
 
-    # ---- Pre-build instructions to avoid blocking later ----
-    agent_instructions = ""
-    if is_outbound and phone_number:
-        # We MUST connect to the room before the SIP participant can be invited, and before session.start
+    # ---- Instructions & Connect ----
+    if is_outbound:
         await ctx.connect()
-        logger.info("Building agent instructions from DB (outbound)...")
+        logger.info("Building agent instructions (outbound)...")
         agent_instructions = await asyncio.to_thread(
-            build_agent_instructions, True, phone_number, contact_type, caller_name_override, target_project
+            build_agent_instructions, True, phone_number, contact_type, caller_name_override, target_project, db_data
         )
-
-    # ---- Inbound: Wait for SIP participant ----
     else:
         logger.info("Inbound call detected. Waiting for caller to connect...")
         await ctx.connect()
@@ -587,22 +533,29 @@ async def entrypoint(ctx: JobContext):
             except Exception as e:
                 logger.error(f"Error waiting for participant: {e}")
 
-        # Create call log for inbound (if we got a phone number)
-        if phone_number and not call_log_id:
-            call_log_id = create_call_log(
-                call_id=ctx.room.name,
-                phone_number=phone_number,
-                contact_type=contact_type,
-                direction="inbound",
-                room_name=ctx.room.name,
-            )
+        # Now fetch data for inbound
+        if phone_number:
+            logger.info(f"Fetching DB data for inbound caller {phone_number}...")
+            db_data = await asyncio.to_thread(get_agent_context_optimized, phone_number)
+            
+            # Create call log for inbound
+            if not call_log_id:
+                call_log_id = create_call_log(
+                    call_id=ctx.room.name,
+                    phone_number=phone_number,
+                    contact_type=contact_type,
+                    direction="inbound",
+                    room_name=ctx.room.name,
+                )
+                record_call_attempt(phone_number, result="initiated", call_log_id=call_log_id)
 
-        logger.info("Building agent instructions from DB (inbound)...")
+        logger.info("Building agent instructions (inbound)...")
         agent_instructions = await asyncio.to_thread(
-            build_agent_instructions, False, phone_number, contact_type, caller_name_override, target_project
+            build_agent_instructions, False, phone_number, contact_type, caller_name_override, target_project, db_data
         )
 
     logger.info(f"Starting agent session. Phone: {phone_number or 'unknown'}, Type: {contact_type}, Outbound: {is_outbound}, Target: {target_project}")
+
 
     # ---- Transcript collector ----
     transcript_messages = []

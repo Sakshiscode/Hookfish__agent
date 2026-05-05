@@ -752,3 +752,94 @@ def get_meetings_for_phone(phone: str, conn=None) -> list:
     except Exception as e:
         logger.error(f"Error getting meetings for {phone}: {e}")
         return []
+def get_agent_context_optimized(phone: str) -> dict:
+    """
+    Optimized multi-fetch for the voice agent.
+    Fetches DNC status, customer info, leads, project details, and meetings in one pass.
+    Uses a single database connection to minimize overhead.
+    """
+    data = {
+        "allowed": True,
+        "reason": "OK",
+        "customer": None,
+        "leads": [],
+        "projects": [],
+        "meetings": [],
+        "attempts_today": 0
+    }
+
+    try:
+        conn = get_connection()
+        with conn.cursor() as cur:
+            # 1. Check DNC
+            cur.execute("SELECT reason FROM agent_dnc_list WHERE phone_number = %s LIMIT 1", (phone,))
+            dnc = cur.fetchone()
+            if dnc:
+                data["allowed"] = False
+                data["reason"] = f"Number is on DNC list ({dnc['reason']})"
+                conn.close()
+                return data
+
+            # 2. Check Daily Limit (Bypass for test numbers)
+            if not any(test_num in phone for test_num in ["6362185137", "7975810190", "6366237201"]):
+                cur.execute(
+                    "SELECT attempt_count FROM agent_call_attempts WHERE phone_number = %s AND attempt_date = CURDATE() LIMIT 1",
+                    (phone,)
+                )
+                attempt = cur.fetchone()
+                if attempt:
+                    data["attempts_today"] = attempt["attempt_count"]
+                    if attempt["attempt_count"] >= 1:
+                        data["allowed"] = False
+                        data["reason"] = "Max 1 call per day reached"
+                        conn.close()
+                        return data
+
+            # 3. Lookup Customer
+            cur.execute(
+                "SELECT id, name, phone, origin FROM customers WHERE phone = %s AND deleted = 0 LIMIT 1",
+                (phone,)
+            )
+            data["customer"] = cur.fetchone()
+
+            # 4. Lookup Leads
+            cur.execute(
+                """
+                SELECT id, customer_name, partner_name, property_name, status, notes, followup
+                FROM all_leads WHERE partner_phone = %s AND deleted = 0
+                ORDER BY created_at DESC LIMIT 5
+                """,
+                (phone,)
+            )
+            data["leads"] = cur.fetchall()
+
+            # 5. Lookup Projects (based on leads)
+            if data["leads"]:
+                prop_names = [l['property_name'] for l in data["leads"] if l.get('property_name')]
+                if prop_names:
+                    # Filter out duplicates
+                    prop_names = list(set(prop_names))
+                    format_strings = ','.join(['%s'] * len(prop_names))
+                    cur.execute(
+                        f"SELECT id, name, alias, type, commission_percentage, site_visit_bonus FROM properties WHERE name IN ({format_strings}) AND (deleted = 0 OR deleted IS NULL)",
+                        tuple(prop_names)
+                    )
+                    data["projects"] = cur.fetchall()
+
+            # 6. Lookup Meetings
+            cur.execute(
+                """
+                SELECT id, meeting_type, meeting_date, meeting_time, location, project_name, manager_name, status
+                FROM agent_meetings WHERE phone_number = %s ORDER BY created_at DESC LIMIT 5
+                """,
+                (phone,)
+            )
+            data["meetings"] = cur.fetchall()
+
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error in optimized fetch for {phone}: {e}")
+        # If DB fails, we still allow the call but with empty context
+        data["reason"] = f"DB Error: {str(e)}"
+    
+    return data
