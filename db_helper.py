@@ -22,33 +22,40 @@ def get_connection():
     )
 
 
-def lookup_customer_by_phone(phone: str) -> dict | None:
+def lookup_customer_by_phone(phone: str, conn=None) -> dict | None:
     """
     Look up a customer by phone number.
     Returns customer info dict or None if not found.
     """
+    close_conn = False
     try:
-        conn = get_connection()
+        if conn is None:
+            conn = get_connection()
+            close_conn = True
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT id, name, phone, origin, created_at FROM customers WHERE phone = %s AND deleted = 0 LIMIT 1",
                 (phone,),
             )
             result = cur.fetchone()
-        conn.close()
+        if close_conn:
+            conn.close()
         return result
     except Exception as e:
         logger.error(f"Error looking up customer by phone {phone}: {e}")
         return None
 
 
-def lookup_lead_by_phone(phone: str) -> list[dict]:
+def lookup_lead_by_phone(phone: str, conn=None) -> list[dict]:
     """
     Look up all leads associated with a phone number (via partner_phone or customer info).
     Returns a list of lead dicts.
     """
+    close_conn = False
     try:
-        conn = get_connection()
+        if conn is None:
+            conn = get_connection()
+            close_conn = True
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -63,20 +70,24 @@ def lookup_lead_by_phone(phone: str) -> list[dict]:
                 (phone,),
             )
             results = cur.fetchall()
-        conn.close()
+        if close_conn:
+            conn.close()
         return results
     except Exception as e:
         logger.error(f"Error looking up leads by phone {phone}: {e}")
         return []
 
 
-def lookup_property_by_name(property_name: str) -> dict | None:
+def lookup_property_by_name(property_name: str, conn=None) -> dict | None:
     """
     Look up a property by name (partial match).
     Returns property info dict or None.
     """
+    close_conn = False
     try:
-        conn = get_connection()
+        if conn is None:
+            conn = get_connection()
+            close_conn = True
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -89,7 +100,8 @@ def lookup_property_by_name(property_name: str) -> dict | None:
                 (f"%{property_name}%",),
             )
             results = cur.fetchall()
-        conn.close()
+        if close_conn:
+            conn.close()
         return results
     except Exception as e:
         logger.error(f"Error looking up property '{property_name}': {e}")
@@ -225,13 +237,13 @@ def save_call_outcome(phone: str, outcome: str, reason: str = None,
         return False
 
 
-def get_project_details_for_lead(phone: str) -> list:
+def get_project_details_for_lead(phone: str, conn=None) -> list:
     """
     Get project/property details associated with a phone number's leads.
     Looks up leads for the phone, then fetches property details for each.
     """
     try:
-        leads = lookup_lead_by_phone(phone)
+        leads = lookup_lead_by_phone(phone, conn=conn)
         if not leads:
             return []
 
@@ -241,7 +253,7 @@ def get_project_details_for_lead(phone: str) -> list:
             prop_name = lead.get('property_name')
             if prop_name and prop_name not in seen_names:
                 seen_names.add(prop_name)
-                prop_details = lookup_property_by_name(prop_name)
+                prop_details = lookup_property_by_name(prop_name, conn=conn)
                 if prop_details:
                     if isinstance(prop_details, list):
                         properties.extend(prop_details)
@@ -427,8 +439,8 @@ def check_call_allowed(phone: str) -> dict:
     Returns: {"allowed": bool, "attempts_today": int, "reason": str}
     Rules: Max 1 attempt per contact per day. No DNC numbers.
     """
-    # Bypass limits for testing number
-    if "6362185137" in phone:
+    # Bypass limits for testing numbers
+    if any(test_num in phone for test_num in ["6362185137", "7975810190", "6366237201"]):
         return {
             "allowed": True,
             "attempts_today": 0,
@@ -713,10 +725,13 @@ def get_manager_email(manager_id: int) -> str | None:
         return None
 
 
-def get_meetings_for_phone(phone: str) -> list:
+def get_meetings_for_phone(phone: str, conn=None) -> list:
     """Get all meetings for a phone number."""
+    close_conn = False
     try:
-        conn = get_connection()
+        if conn is None:
+            conn = get_connection()
+            close_conn = True
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -731,7 +746,8 @@ def get_meetings_for_phone(phone: str) -> list:
                 (phone,),
             )
             results = cur.fetchall()
-        conn.close()
+        if close_conn:
+            conn.close()
         return results
     except Exception as e:
         logger.error(f"Error getting meetings for {phone}: {e}")

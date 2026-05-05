@@ -1,0 +1,41 @@
+import asyncio
+import os
+import aiohttp
+from dotenv import load_dotenv
+
+load_dotenv()
+
+async def test_v31():
+    api_key = os.getenv("SMALLEST_API_KEY")
+    # Trying the the URL from the search results
+    url = "https://api.smallest.ai/waves/v1/lightning-v3.1/get_speech"
+    
+    data = {
+        "voice_id": "voice_mqlzuqZJiq",
+        "text": "Hello, how are you?",
+        "sample_rate": 24000,
+        "speed": 1.0,
+        "language": "en",
+        "output_format": "pcm"
+    }
+    
+    print(f"Testing Smallest AI v3.1 URL: {url}...")
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.post(
+                url,
+                headers={"Authorization": f"Bearer {api_key}"},
+                json=data,
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
+                print(f"Status: {resp.status}")
+                if resp.status == 200:
+                    print("SUCCESS!")
+                else:
+                    text = await resp.text()
+                    print(f"ERROR: {text}")
+        except Exception as e:
+            print(f"EXCEPTION: {e}")
+
+if __name__ == "__main__":
+    asyncio.run(test_v31())

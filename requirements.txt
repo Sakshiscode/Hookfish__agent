@@ -1,17 +1,17 @@
 # Hookfish Voice Agent + Dashboard API — Production Dependencies
 
 # LiveKit Agent Framework
-livekit-agents[codecs]==1.5.1
-livekit-api==1.1.0
-livekit-plugins-silero==1.4.1
-livekit-plugins-deepgram==1.4.2
-livekit-plugins-openai==1.4.2
-livekit-plugins-smallestai==1.5.1
-livekit-plugins-elevenlabs==1.4.2
-livekit-plugins-azure==1.5.0
-livekit-plugins-cartesia==1.5.1
-livekit-plugins-sarvam==1.5.1
-livekit-plugins-groq==1.4.2
+livekit-agents[codecs]>=1.5.0
+livekit-api>=1.1.0
+livekit-plugins-silero
+livekit-plugins-deepgram
+livekit-plugins-openai
+livekit-plugins-smallestai
+livekit-plugins-elevenlabs
+livekit-plugins-azure
+livekit-plugins-cartesia
+livekit-plugins-sarvam
+livekit-plugins-groq
 
 # Database
 PyMySQL==1.1.2

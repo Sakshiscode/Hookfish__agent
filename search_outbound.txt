@@ -1,0 +1,21 @@
+278: def build_agent_instructions(is_outbound: bool = False, phone_number: str = None,
+310: if not is_outbound:
+366: def __init__(self, instructions: str, is_outbound: bool = False, phone_number: str = None,
+369: logger.info(f"Agent initialized. Contact type: {contact_type}, Outbound: {is_outbound}")
+391: self._is_outbound = is_outbound
+396: async def on_enter(self):
+397: if not self._is_outbound:
+398: await self.session.generate_reply()
+440: is_outbound = False
+456: is_outbound = True
+462: if is_outbound and phone_number:
+493: direction="outbound" if is_outbound else "inbound",
+501: if is_outbound and phone_number:
+504: logger.info("Building agent instructions from DB (outbound)...")
+563: logger.info(f"Starting agent session. Phone: {phone_number or 'unknown'}, Type: {contact_type}, Outbound: {is_outbound}, Target: {target_project}")
+1026: is_outbound=is_outbound,
+1068: if is_outbound and phone_number:
+1069: logger.info(f"Placing outbound call to: {phone_number}")
+1092: logger.info("Agent generating initial outbound greeting...")
+1094: await voice_agent.session.generate_reply(
+1100: logger.error(f"Error placing outbound call: {e}")

@@ -35,12 +35,6 @@ generate_audio.py
 setup_vobiz_trunks.py
 create_agent_tables.py
 
-# Trigger scripts (not needed in cloud — calls triggered via API)
-call_trigger.py
-batch_call.py
-batch_call_trigger.py
-batch_call_campaign.py
-
 # Docs
 *.md
 agent_sig.txt

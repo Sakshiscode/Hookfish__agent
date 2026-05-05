@@ -169,6 +169,30 @@ TABLES = [
         INDEX idx_date (attempt_date)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     """,
+
+    # ── 6. WhatsApp Message Logs ─────────────────────────────────
+    """
+    CREATE TABLE IF NOT EXISTS agent_whatsapp_logs (
+        id                  VARCHAR(36) PRIMARY KEY,
+        phone_number        VARCHAR(20) NOT NULL,
+        message_type        VARCHAR(50) NOT NULL COMMENT 'meeting_confirmation, project_details, reminder',
+        template_name       VARCHAR(100) NULL COMMENT 'WhatsApp template name if used',
+        message_content     TEXT COMMENT 'Message content or summary',
+        whatsapp_message_id VARCHAR(255) NULL COMMENT 'WhatsApp API message ID',
+        status              VARCHAR(20) DEFAULT 'sent' COMMENT 'sent, delivered, read, failed',
+        meeting_id          VARCHAR(36) NULL COMMENT 'FK to agent_meetings',
+        call_log_id         VARCHAR(36) NULL COMMENT 'FK to agent_call_logs',
+        error_message       TEXT NULL COMMENT 'Error details if failed',
+        created_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at          DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+        INDEX idx_phone (phone_number),
+        INDEX idx_type (message_type),
+        INDEX idx_status (status),
+        INDEX idx_meeting (meeting_id),
+        INDEX idx_created (created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """,
 ]
 
 
@@ -194,7 +218,7 @@ def create_tables():
     print("Verifying tables...")
     expected = [
         "agent_call_logs", "agent_dnc_list", "agent_managers",
-        "agent_meetings", "agent_call_attempts"
+        "agent_meetings", "agent_call_attempts", "agent_whatsapp_logs"
     ]
     for table in expected:
         cur.execute(f"SHOW TABLES LIKE '{table}'")

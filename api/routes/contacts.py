@@ -103,16 +103,34 @@ async def import_csv(list_id: str, file: UploadFile = File(...)):
     with get_db() as conn:
         with conn.cursor() as cur:
             for row in reader:
-                row = {k.lower().strip(): v.strip() for k, v in row.items() if v}
-                phone = row.get("phone", "").strip()
+                # Standardize keys: lowercase and stripped
+                processed_row = {k.lower().strip(): v.strip() for k, v in row.items() if v}
+                
+                # Extract phone (mandatory)
+                phone = processed_row.get("phone", "").strip()
                 if not phone:
                     skipped += 1
                     continue
+                
+                # Standardize phone to +91 if 10 digits
                 if not phone.startswith("+") and len(phone) == 10:
                     phone = "+91" + phone
+                
+                # Find name in variations
+                name_keys = ["name", "full name", "first name", "customer", "contact", "lead name", "username", "caller name"]
+                name = None
+                for key in name_keys:
+                    if key in processed_row:
+                        name = processed_row[key]
+                        break
+                
+                # Find email/company in variations
+                email = processed_row.get("email") or processed_row.get("email id") or processed_row.get("mail")
+                company = processed_row.get("company") or processed_row.get("organization") or processed_row.get("firm")
+
                 try:
                     cur.execute("INSERT INTO agent_contacts (id, list_id, name, phone, email, company) VALUES (%s,%s,%s,%s,%s,%s)",
-                                (str(uuid.uuid4()), list_id, row.get("name"), phone, row.get("email"), row.get("company")))
+                                (str(uuid.uuid4()), list_id, name, phone, email, company))
                     imported += 1
                 except Exception:
                     skipped += 1

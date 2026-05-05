@@ -125,7 +125,7 @@ app.include_router(settings.router)
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("API_PORT", 8000))
+    port = int(os.getenv("PORT", 8000))
     print(f"\n{'='*50}")
     print(f"  Hookfish Dashboard API")
     print(f"  http://localhost:{port}")

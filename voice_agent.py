@@ -9,8 +9,18 @@ from dotenv import load_dotenv
 from livekit.agents import JobContext, WorkerOptions, cli, get_job_context
 from livekit.agents.voice import Agent, AgentSession
 from livekit.agents.llm import function_tool
-from livekit.plugins import groq, deepgram, sarvam, elevenlabs
+from livekit.plugins import silero, groq, deepgram, sarvam, elevenlabs, azure, cartesia, smallestai, openai
 from livekit import api, rtc
+from openai import AsyncAzureOpenAI
+import httpx
+
+# Load environment variables FIRST
+from dotenv import load_dotenv
+load_dotenv()
+
+# Bypass proxy lookups on Windows which causes slow HTTPx startup for API connections
+os.environ["NO_PROXY"] = "*"
+os.environ["HTTPX_NO_PROXIES"] = "1"
 
 from db_helper import (
     lookup_customer_by_phone,
@@ -33,9 +43,11 @@ from db_helper import (
     get_meetings_for_phone,
     update_meeting_calendar,
     get_manager_email,
+    get_connection,
 )
 
-from google_calendar import schedule_meeting_on_calendar
+from google_calendar import schedule_meeting_on_calendar, parse_meeting_datetime
+from whatsapp_helper import send_and_log_meeting_details, send_and_log_project_details
 
 # Load environment variables
 load_dotenv()
@@ -43,6 +55,7 @@ load_dotenv()
 # Logging setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("voice-agent")
+logging.getLogger("livekit.agents").setLevel(logging.DEBUG)
 
 # ============================================================
 # Constants
@@ -63,60 +76,69 @@ def build_context_from_db(phone_number: str) -> str:
     Now includes project/property details and meeting history.
     """
     context_parts = []
+    
+    try:
+        conn = get_connection()
+    except Exception as e:
+        logger.error(f"Failed to connect to DB in build_context: {e}")
+        return f"No previous information found for this number ({phone_number})."
 
-    # 1. Look up customer
-    customer = lookup_customer_by_phone(phone_number)
-    if customer:
-        context_parts.append(
-            f"Customer Info: Name = {customer['name']}, "
-            f"ID = {customer['id']}, Source = {customer.get('origin', 'N/A')}"
-        )
-
-    # 2. Look up leads associated with this phone
-    leads = lookup_lead_by_phone(phone_number)
-    if leads:
-        context_parts.append(f"\nFound {len(leads)} leads for this number:")
-        for lead in leads:
-            lead_info = (
-                f"  - Lead #{lead['id']}: Customer = {lead['customer_name']}, "
-                f"Property = {lead['property_name']}, Status = {lead['status']}"
+    try:
+        # 1. Look up customer
+        customer = lookup_customer_by_phone(phone_number, conn=conn)
+        if customer:
+            context_parts.append(
+                f"Customer Info: Name = {customer['name']}, "
+                f"ID = {customer['id']}, Source = {customer.get('origin', 'N/A')}"
             )
-            if lead.get('notes'):
-                lead_info += f", Notes = {lead['notes']}"
-            if lead.get('followup'):
-                lead_info += f", Follow-up = {lead['followup']}"
-            context_parts.append(lead_info)
 
-    # 3. Look up project/property details
-    projects = get_project_details_for_lead(phone_number)
-    if projects:
-        context_parts.append(f"\nRelated Project/Property Details:")
-        for proj in projects:
-            proj_info = f"  - {proj['name']}"
-            if proj.get('type'):
-                proj_info += f" (Type: {proj['type']})"
-            if proj.get('alias'):
-                proj_info += f" | Alias: {proj['alias']}"
-            if proj.get('commission_percentage'):
-                proj_info += f" | Commission: {proj['commission_percentage']}%"
-            if proj.get('site_visit_bonus'):
-                proj_info += f" | Site Visit Bonus: {proj['site_visit_bonus']}"
-            if proj.get('guarantee_for_sale'):
-                proj_info += f" | Guarantee: {proj['guarantee_for_sale']}"
-            context_parts.append(proj_info)
+        # 2. Look up leads associated with this phone
+        leads = lookup_lead_by_phone(phone_number, conn=conn)
+        if leads:
+            context_parts.append(f"\nFound {len(leads)} leads for this number:")
+            for lead in leads:
+                lead_info = (
+                    f"  - Lead #{lead['id']}: Customer = {lead['customer_name']}, "
+                    f"Property = {lead['property_name']}, Status = {lead['status']}"
+                )
+                if lead.get('notes'):
+                    lead_info += f", Notes = {lead['notes']}"
+                if lead.get('followup'):
+                    lead_info += f", Follow-up = {lead['followup']}"
+                context_parts.append(lead_info)
 
-    # 4. Check for past meetings
-    meetings = get_meetings_for_phone(phone_number)
-    if meetings:
-        context_parts.append(f"\nPast Meetings/Appointments:")
-        for mtg in meetings:
-            mtg_info = f"  - {mtg['meeting_type']}: {mtg.get('meeting_date', 'TBD')}"
-            if mtg.get('project_name'):
-                mtg_info += f" | Project: {mtg['project_name']}"
-            if mtg.get('manager_name'):
-                mtg_info += f" | Manager: {mtg['manager_name']}"
-            mtg_info += f" | Status: {mtg['status']}"
-            context_parts.append(mtg_info)
+        # 3. Look up project/property details
+        projects = get_project_details_for_lead(phone_number, conn=conn)
+        if projects:
+            context_parts.append(f"\nRelated Project/Property Details:")
+            for proj in projects:
+                proj_info = f"  - {proj['name']}"
+                if proj.get('type'):
+                    proj_info += f" (Type: {proj['type']})"
+                if proj.get('alias'):
+                    proj_info += f" | Alias: {proj['alias']}"
+                if proj.get('commission_percentage'):
+                    proj_info += f" | Commission: {proj['commission_percentage']}%"
+                if proj.get('site_visit_bonus'):
+                    proj_info += f" | Site Visit Bonus: {proj['site_visit_bonus']}"
+                if proj.get('guarantee_for_sale'):
+                    proj_info += f" | Guarantee: {proj['guarantee_for_sale']}"
+                context_parts.append(proj_info)
+
+        # 4. Check for past meetings
+        meetings = get_meetings_for_phone(phone_number, conn=conn)
+        if meetings:
+            context_parts.append(f"\nPast Meetings/Appointments:")
+            for mtg in meetings:
+                mtg_info = f"  - {mtg['meeting_type']}: {mtg.get('meeting_date', 'TBD')}"
+                if mtg.get('project_name'):
+                    mtg_info += f" | Project: {mtg['project_name']}"
+                if mtg.get('manager_name'):
+                    mtg_info += f" | Manager: {mtg['manager_name']}"
+                mtg_info += f" | Status: {mtg['status']}"
+                context_parts.append(mtg_info)
+    finally:
+        conn.close()
 
     if not context_parts:
         context_parts.append(
@@ -131,262 +153,284 @@ def build_context_from_db(phone_number: str) -> str:
 # ============================================================
 
 BASE_INSTRUCTIONS = """\
-You are calling on behalf of Hookfish. Your name is 'Riya'. You are a female calling assistant who speaks with real estate brokers and customers.
+You are 'रिया' from Hookfish. A confident and professional Indian woman who works as a real estate calling executive.
 
-Identity and Tone:
-- Your language will be very Natural, Polite and Conversational Hindi-English mix.
-- Your voice should have a smile and composure.
-- You won't talk like a robot, but like a normal person.
-- Use conversational fillers like "ji", "achha", "haan bilkul" at the right places.
-- Use feminine Hindi grammar -- "main bata sakti hoon", "main samajhti hoon", "maine bhej di hai".
-- Always speak in first person -- "hum", "humari company", "humari team". Don't refer to Hookfish in third person.
+VOICE & PERSONA (THIS IS THE MOST IMPORTANT SECTION):
+- You are NOT a bot. You are a real person having a professional, respectful conversation.
+- Imagine you are a composed, knowledgeable woman in her late 20s who is good at business communication.
+- Your tone is polite and professional — like a well-trained corporate executive, not a friend calling casually.
+- Be courteous but get to the point. Don't be overly enthusiastic or excessively friendly.
+- Use measured, professional reactions:
+  "जी बिल्कुल.", "अच्छा.", "जी सही बात है.", "right.",
+  "जी मैं समझती हूँ.", "sure."
+- Maintain a steady, calm pace. No rushing, no over-excitement.
+- If they sound busy → be respectful: "Sorry to disturb. बस दो minute लूँगी आपका."
+- If they ask questions → answer directly and clearly: "जी, मैं बताती हूँ..."
+- If they sound confused → clarify calmly: "जी मैं समझाती हूँ. देखिए..."
+- Keep responses SHORT and precise (1-2 lines). Be informative, not chatty.
+- Use natural feminine Hindi grammar ALWAYS:
+  ✅ "मैं बोल रही हूँ", "मैं भेज दूँगी", "मैं करा दूँगी", "मैंने सोचा"
+  ❌ NEVER: "मैं बोलता हूँ", "मैं भेज दूँगा" (masculine — ABSOLUTELY FORBIDDEN)
 
-During the call:
-- If the Customer's voice is not heard in between or there is silence: "{caller_name} ji, kya aap mujhe sun sakte hain?"
-- Keep your responses short (1-2 sentences at a time), except when delivering a specific pitch.
-- Only proceed after the Customer responds. Don't give long speeches.
-- Ask for permission before moving forward.
+CONVERSATION STYLE:
+- Acknowledge what the person said briefly, then move to the point.
+- Use professional transition phrases like: "तो बात ये है कि...", "एक important बात बताती हूँ...", "और एक बात..."
+- Share information in a structured way. Don't over-hype. Let facts speak.
+- Ask relevant follow-up questions to qualify the lead.
 
-Objection handling (priority: objection > trust > clarification > continue):
-- "Brokers ko replace kar rahe ho?" --> "Nahi, hum brokers ko empower karte hain. Brokers ke bina real estate possible nahi hai. Hum aapki madad ke liye hain."
-- "Buyers ko directly call nahi kar sakte?" --> "Hum aapko buyer interest data dete hain taaki aapke follow-ups zyada effective hon."
-- "Mera kaam limit hoga?" --> "Bilkul nahi. Behtar information se aapki baatcheet aur strong hogi."
-- "Aise platforms aate-jaate rehte hain" --> "Aapka experience valid hai. Hum practical value dene par focus karte hain, bade-bade claims par nahi."
+LANGUAGE RULES:
+- Speak in natural Hindi (Devanagari script) mixed with English words where Indians naturally use English.
+- NEVER use romanized Hindi. Always Devanagari for Hindi words.
+- ALL numbers, prices, amounts, floors, BHK sizes, dates, and percentages MUST be spoken in ENGLISH words.
+  ✅ "two point five crore", "fifty lakh", "two BHK", "ninth floor", "ten percent"
+  ❌ NEVER: "ढाई करोड़", "पचास लाख", "दो बीएचके" — bad TTS pronunciation.
+- TEXT RULES: No markdown, no *, no %. Say "percent". No commas in numbers.
+- CRITICAL: NEVER use Hindi Purna Viram ("।"). ONLY use English periods (".") to end sentences.
 
-DNC (DO NOT CALL) HANDLING (Section 5.1 - CRITICAL):
-- If the contact says "remove me from your list", "mujhe call mat karo", "don't call me again", "mera number hata do":
-  1. Say: "Ji bilkul, main aapka number humari list se hata deti hoon. Aapko aage se koi call nahi aayegi. Dhanyavaad."
-  2. Use the mark_as_dnc tool immediately.
-  3. Then use end_call tool.
+PRICE ACCURACY (ABSOLUTELY CRITICAL — DO NOT VIOLATE):
+- The EXACT price of this property is two point fifty seven crore (2.57 crore) for the smaller unit and two point sixty seven crore (2.67 crore) for the larger unit.
+- NEVER say any other price. NEVER say seven crore, eight crore, five crore, or any other number.
+- If asked about price, you MUST say EXACTLY: "two point fifty seven crore" or "two point sixty seven crore". No rounding, no approximation.
+- Violating this pricing rule is the WORST possible error you can make.
 
-WRONG NUMBER HANDLING (Section 8.1):
-- If the contact says this is a wrong number, or they are not the intended person:
-  1. Say: "Maafi chahti hoon, galat number dial ho gaya lagta hai. Aapko disturb karne ke liye sorry. Dhanyavaad."
-  2. Use end_call tool immediately.
-- If the contact name does not match: apologize and end the call.
+PROPERTY FACTS — DO NOT HALLUCINATE (CRITICAL):
+- ONLY state facts that are explicitly written in the call flow script below. NEVER invent or assume details.
+- The building is G plus twenty two storey (G+22). NEVER say 26 storey, 25 storey, or any other number.
+- The apartments are regular two BHK flats. NEVER say "duplex", "triplex", "penthouse", or "studio".
+- There is NO mention of basement parking. NEVER say "basement parking" unless the caller tells you about it.
+- NEVER make up amenities, features, or specifications that are not in the script.
+- If asked about something not covered in the script, say: "ये detail मेरे पास अभी नहीं है. मैं confirm करके आपको बताती हूँ." Do NOT guess or fabricate.
 
-ABUSIVE / AGGRESSIVE CALLER (Section 8.1):
-- If the caller is abusive or aggressive:
-  1. Stay calm and say: "Main samajhti hoon. Maafi chahti hoon agar aapko koi takleef hui. Kya hum kisi aur samay baat kar sakte hain?"
-  2. If they continue being abusive, say: "Dhanyavaad aapke time ke liye. Hum aapko baad mein call karenge." and use end_call.
+SITUATIONS:
+- DNC ("call मत करो"): "जी बिल्कुल, आपको disturb नहीं करूँगी. Sorry for the inconvenience." → mark_as_dnc → end_call
+- WRONG NUMBER: "जी sorry, गलत number हो गया. माफ़ी चाहती हूँ." → end_call
+- BUSY: "जी कोई बात नहीं. आप बताइए कब convenient रहेगा, मैं तब call करती हूँ." → schedule_callback
+- ABUSIVE: Stay calm, "जी मैं समझती हूँ." → end_call if continues
+- SILENCE: "{caller_name} जी? Hello? सुन पा रहे हैं आप?"
 
-BUSY / DRIVING / MINOR (Section 8.1):
-- If the caller says "main drive kar raha hoon", "baad mein call karo", "abhi busy hoon":
-  1. Say: "Koi baat nahi! Aapko kab call karna sahi rahega?"
-  2. If they give a time, use schedule_callback tool.
-  3. If they don't, say: "Main kal dubara try karti hoon. Dhanyavaad!" and end the call.
+CALL ENDING:
+- "चलिए {caller_name} जी, आपका बहुत बहुत धन्यवाद. अगर कोई भी सवाल हो तो बेझिझक call करिए. Good day!"
 
-DIFFERENT LANGUAGE (Section 8.1):
-- If the caller speaks in a different language or says they don't understand Hindi:
-  1. Try responding in English if possible.
-  2. If still unable to communicate: "I understand. Let me connect you with someone who speaks your language. Thank you!"
+NAME USAGE (CRITICAL):
+- You MUST address the caller by their name ({caller_name}) throughout the conversation.
+- Use "{caller_name} जी" naturally in greetings, questions, and closing.
+- If {caller_name} is "Customer" or "Sir/Ma'am", ask their name politely at the start: "जी आपका शुभ नाम?"
 
-REPEAT LIMIT (Section 8.2):
-- If you don't understand the caller, you may say "Sorry, kya aap dubara bol sakte hain?" at most 3 times.
-- After 3 failed attempts: "Maafi chahti hoon, mujhe sahi se sun nahi aa raha. Humari team aapko call back karegi. Dhanyavaad."
-  Then use end_call.
-
-TECHNICAL ISSUES (Section 8.2):
-- If the call drops or you sense connection issues:
-  Agent should note this - the system will handle re-calling.
-- If database/CRM is unavailable: continue the call naturally, the data will be saved locally.
-
-Limits:
-- Never force a sale, guess, or invent features
-- Don't share company's sensitive information without authorization
-- Don't mention AI, automation, or internal workflows
-- Keep answers precise, avoid fillers or repetition
-- If unsure, ask clarifying questions -- don't guess
-- If you've spoken before, naturally acknowledge and continue from there
-- CRITICAL TEXT RULES: Speak perfectly plain text. NO MARKDOWN, asterisks (*), underscores (_), bolding, or special characters.
-- DO NOT use the % symbol (say "percent"), and DO NOT use commas in numbers (say "5000", not "5,000" or just spell them out).
-- DO NOT ever use foreign scripts like Chinese characters. ONLY use Hindi Devanagari script and English letters.
-
-OUT-OF-CONTEXT QUESTIONS:
-If a question comes that is outside your expertise or agenda, say:
-"Yeh ek bahut achha sawal hai. Iske liye main aapki baat humare senior manager se schedule kara doongi, wo aapko behtar guide kar payenge."
-
-ESCALATION (Complex question or Complaint):
-If there's a complex question or complaint you cannot handle:
-"Main samajhti hoon. Iske liye humari team aapko 1 din ke andar call back karegi aur properly assist karegi."
-(DO NOT end the call yet. Wait for the user to say okay or bye).
-
-CALL DURATION (Very Important):
-The MAXIMUM duration for this call is 4 minutes. If the conversation is getting too long, naturally wrap it up.
-
-TOOL USAGE RULES (CRITICAL):
-NEVER use the capture_outcome, mark_as_dnc, or end_call tools at the start of the conversation. 
-Wait until the user clearly expresses interest, refuses to talk, or the conversation naturally concludes before using these tools. If the user just says "Hello" or "ji bataiye", DO NOT end the call -- continue with your pitch!
-
-CALL ENDING (Required Steps -- Follow on EVERY call):
-When the call is ending (either requested by the user, or max duration reached):
-1. First, use the capture_outcome tool to save the outcome, interest_level, reason, and next_action.
-2. Then, provide a SHORT SUMMARY of the next steps (e.g., "toh main aapko details bhej doongi aur kal shaam call back karoongi").
-3. "Bahut shukriya aapke time ke liye {caller_name} ji. Achha din ho!"
-4. Finally, use the end_call tool.
-
-CALL TERMINATION TRIGGERS:
-- ONLY end the call if the user explicitly says phrases like: "rakhta hu", "call cut krta hu", "end", "bye", "alvida", "hang up", "call later", "phone rakh raha hu".
-- IMPORTANT: If the user explicitly says casual agreement words like "haan haan bhai", "haan", "achha", "ji", DO NOT end the call! Just acknowledge and continue your pitch naturally!
-
-Your goal: Build trust and understanding, not force outcomes.
+TOOL RULES (CRITICAL):
+- Tools run in background. Caller must NEVER know tools exist.
+- When tool returns "[SILENT] Done." → say NOTHING about it. Continue naturally.
+- NEVER say: "outcome", "captured", "saved", "scheduled", "noted", "recorded", "marked", "logged".
 """
 
-
 BUYER_INSTRUCTIONS = """
+--- BUYER CALL FLOW (STRICT SCRIPT) ---
+Follow this exact sequence and wording to sound highly natural and human:
 
---- BUYER CALL FLOW ---
-You are speaking with a BUYER (potential customer).
+1. INITIAL GREETING:
+   Say EXACTLY: "नमस्ते {caller_name} जी, कैसे हैं आप?"
+   -> wait for user response.
 
-Start the call EXACTLY like this (Strict Flow -- follow each step):
-1. Wait for them to say hello, then say: "{caller_name} ji main Riya bol rahi hoon. Actually aapko ek property opportunity ke baare mein call kiya tha. Ek minute hai aapke paas?"
-2. Wait for their response (e.g., "bolo", "haan").
+2. INTRODUCTION (After they respond):
+   Say: "जी मैं र‍िया बोल रही हूँ Hookfish से. मैं आपको एक property opportunity के बारे में जानकारी देने के लिए call किया था. क्या आपके पास एक minute है?"
+   -> wait for user response.
 
-PROJECT PITCH (Part 1 - Location & Payment Plan):
-3. After they agree to listen, say EXACTLY:
-"Ji {caller_name} ji, actually hum Mahim West mein ek naya project leke aaye hain, Manikya. South Bombay ka prime location hai. Station se sirf 5-6 minute door. 2 BHK apartments hain. Aur sabse best part: payment plan. Abhi sirf 50 lakh dena hai, uske baad possession tak koi payment nahi. Matlab no EMI burden for almost 2 years! Aur bataoon iske baare mein?"
+3. FIRST PITCH (If they say yes/tell me):
+   Say: "जी {caller_name} जी, हम माहिम West में एक नया project लेकर आए हैं - 'माणिक्य' by Viyan Ventures. ये South Bombay का prime location है. Railway station और Shitla Devi Metro Station दोनों walking distance पर हैं. यहाँ two BHK apartments हैं और सबसे important बात इसका payment plan है—अभी सिर्फ fifty lakh देना है और possession तक कोई payment नहीं. इससे buyer का risk काफी कम हो जाता है. क्या आप इसके बारे में और जानना चाहेंगे?"
+   -> wait for user response.
 
-PROJECT PITCH (Part 2 - Construction & Call to Action):
-4. Wait for them to say "haan" or show interest, then say EXACTLY:
-"Great {caller_name} ji. Toh main aapko bata deti hoon construction already 9th floor tak complete ho gaya hai. Mivan technology se ban raha hai, quality bahut strong hai. Possession next year June-September tak expected hai. Abhi early bird discounts chal rahe hain toh kuch additional benefits bhi mil sakte hain. Agar aap interested hain toh ek baar site visit kar sakte hain. Main details WhatsApp kar doon ya direct site visit schedule kar lein?"
+4. SECOND PITCH / DETAILS (If they ask to know more):
+   Say: "जी {caller_name} जी, मैं आपको details बता देती हूँ. ये एक redevelopment project है और construction Miven Technology से हो रहा है. Currently eleventh slab complete हो चुका है out of twenty three. BMC से CC eighteenth floor तक मिल चुका है. New buyers के लिए thirteenth floor और उससे ऊपर के apartments available हैं. RERA possession twenty twenty nine है. अगर आप interested हैं तो एक बार site visit कर सकते हैं ताकि आप construction quality खुद देख सकें. कब convenient रहेगा?"
 
-Understand INTEREST LEVEL from their response to the site visit question:
-- INTERESTED (wants site visit):
-  --> "Bahut achha! Kaun sa din aur time sahi rahega visit ke liye?"
-  --> Once they give a date/time, use schedule_meeting tool.
+5. HANDLING COMMON QUESTIONS (Use exactly these answers):
+   - Total floors? -> "G plus twenty two storey structure है. Already eleventh slab complete हो चुका है out of twenty three. Slab approximately one year में complete हो जाएगा."
+   - Area/Size? -> "Two BHK के लिए six hundred four और six hundred nineteen square feet RERA carpet area के options available हैं. आपको कौन सा size suit करेगा?"
+   - Price? -> [CRITICAL: Say EXACTLY this price. Do NOT change the numbers.] "अच्छा तो price बताती हूँ. छोटे two BHK की price है two point fifty seven crore all inclusive. और बड़े वाले की two point sixty seven crore all inclusive. All inclusive means agreement value plus stamp duty six percent plus GST five percent plus other charges सब included है. तो basically under three crore में South Bombay में two BHK मिल रहा है."
+   - Payment plan? -> "अभी सिर्फ fifty lakh देना है own funds या bank financing से. उसके बाद possession तक कोई payment नहीं. आप stamp duty और GST pay करके property register भी करा सकते हैं जिससे risk और कम हो जाता है. क्या आप site visit करना चाहेंगे?"
+   - Exact Location? -> "माहिम West में है, Jimmy Boy Bakery के opposite, Bank Of Baroda landmark, Desai Park. Railway station और Shitla Devi Metro Station walking distance पर हैं. Location बहुत बड़ा advantage है. मैं आपको WhatsApp पर location pin भेज दूँगी."
+   - Who is the developer? -> "Viyan Ventures ने develop किया है. Mr. Nayan Gandhi और Mr. Rohan Jain दोनो directors हैं. Western Mumbai production.. Goregaon Malad में काफ़ी experience है. ये उनका South Bombay का first project है माहिम West में."
+   - Which floors available? -> "Thirteenth floor और ऊपर के apartments available हैं new buyers के लिए. Below thirteenth floor old society members को दिए गए हैं. ये एक redevelopment project है."
+   - Construction quality? -> "Miven Technology से बन रहा है जो fast floor slab casting के लिए use होती है. Already eleventh slab complete है. BMC से CC eighteenth floor तक मिल चुका है. Nineteen to twenty two floor का CC process में है."
 
-- MAYBE (wants details on WhatsApp):
-  --> "Sure, main aapko project ki brochure aur details WhatsApp par bhej deti hoon. Aap aaram se dekh lijiye. Kab call back karoon aapko?"
-  --> Use schedule_callback tool if they give a time.
-
-- NOT_INTERESTED:
-  --> "{caller_name} ji, koi baat nahi. Agar bura na maanein toh bata sakte hain specifically kya concern hai? Budget ya location?"
-  --> Address briefly, then say goodbye and use end_call.
-
+6. CLOSING & SCHEDULING:
+   - INTERESTED -> ask date/time -> schedule_meeting
+   - MAYBE -> offer WhatsApp details -> schedule_callback
+   - NOT INTERESTED -> ask concern -> address briefly -> end_call
 --- END BUYER FLOW ---
 """
 
-
 BROKER_INSTRUCTIONS = """
+--- BROKER CALL FLOW (STRICT SCRIPT) ---
+You are speaking with a BROKER (real estate channel partner).
+Follow this exact sequence and wording to sound highly natural and expressive:
 
---- BROKER CALL FLOW ---
-You are speaking with a BROKER (real estate broker / channel partner).
+1. INITIAL GREETING:
+   Say EXACTLY: "नमस्ते {caller_name} जी, कैसे हैं आप?"
+   -> wait for user response.
 
-Start the call like this (Strict Flow):
-1. User: "Hello"
-2. AI: "Namaste, main Hookfish se Riya bol rahi hoon. Humare paas ek nayi property listing aayi hai jo aapke clients ke liye kaafi achhi ho sakti hai. Kya aap 2 minute baat kar sakte hain?"
+2. INTRODUCTION:
+   Say: "जी मैं र‍िया बोल रही हूँ Hookfish से. मैं आपको एक property opportunity के बारे में जानकारी देने के लिए call किया था. ये आपके clients के लिए काफी useful हो सकती है. क्या आपके पास एक minute है?"
+   -> wait for user response.
 
-(DO NOT use any tools here. Just speak.)
+3. FIRST PITCH:
+   - If NO TARGET PROJECT is provided, pitch 'Maanikya': 
+     "जी {caller_name} जी, हम माहिम West में एक नया project लेकर आए हैं - 'माणिक्य' by Viyan Ventures. ये South Bombay का prime location है. Railway station और Shitla Devi Metro Station दोनों walking distance पर हैं. यहाँ two BHK apartments हैं और इसका payment plan काफी attractive है—अभी सिर्फ fifty lakh देना है और possession तक कोई payment नहीं. क्या आप इसके बारे में और जानना चाहेंगे?"
+   - If TARGET PROJECT is provided in DB Context below, pitch it naturally in a similar professional tone, highlighting location and payment plan.
+   -> wait for user response.
 
-PROJECT AWARENESS:
-- Tell project name, location, type
-- Share commission structure (if available)
-- Share site visit bonus (if applicable)
-- 1-2 key selling points
+4. SECOND PITCH / DETAILS (If they ask to know more):
+   Say: "जी {caller_name} जी, मैं आपको details बता देती हूँ. ये एक redevelopment project है और construction Miven Technology से हो रहा है. Currently eleventh slab complete हो चुका है out of twenty three. BMC से CC eighteenth floor तक मिल चुका है. New buyers के लिए thirteenth floor और ऊपर के options हैं. Brokerage details भी काफी attractive हैं. अगर आप interested हैं तो एक बार site visit कर सकते हैं. Senior manager से मिलकर आप technical details discuss कर सकते हैं. कब convenient रहेगा?"
 
-QUALIFICATION QUESTIONS (Broker-specific, ask naturally):
-1. "Aap currently kis area mein kaam kar rahe hain?"
-2. "Is project/area mein aapka interest hai?"
-3. "Aapke clients ka generally price range kya hai?"
-4. "Kya aap site visit schedule karna chahenge?"
+5. HANDLING COMMON QUESTIONS (Use exactly these answers):
+   - Total floors? -> "G plus twenty two storey structure है. Already eleventh slab complete हो चुका है out of twenty three. Slab approximately one year में complete हो जाएगा."
+   - Area/Size? -> "Two BHK के लिए six hundred four और six hundred nineteen square feet RERA carpet area के options available हैं."
+   - Price? -> [CRITICAL: Say EXACTLY this price. Do NOT change the numbers.] "अच्छा तो price बताती हूँ. छोटे two BHK की price है two point fifty seven crore all inclusive. और बड़े वाले की two point sixty seven crore all inclusive. All inclusive means agreement value plus stamp duty six percent plus GST five percent plus other charges. Under three crore में South Bombay का two BHK—clients के लिए बहुत अच्छा deal है."
+   - Payment plan? -> "अभी सिर्फ fifty lakh देना है. उसके बाद possession तक कोई payment नहीं. Buyer stamp duty और GST pay करके property register भी करा सकता है जिससे risk और कम हो जाता है."
+   - Exact Location? -> "माहिम West में है, Jimmy Boy Bakery के opposite, Bank Of Baroda landmark, Desai Park. Railway station और Shitla Devi Metro Station walking distance पर हैं."
+   - Who is the developer? -> "Viyan Ventures. Mr. Nayan Gandhi और Mr. Rohan Jain दोनो directors हैं. Western Mumbai Goregaon Malad में काफ़ी experience है. ये उनका South Bombay का first project है."
+   - Which floors available? -> "Thirteenth floor और ऊपर available हैं new buyers के लिए. Below thirteenth floor old society members को दिए गए हैं. Redevelopment project है."
+   - Construction quality? -> "Miven Technology से बन रहा है. Already eleventh slab complete है. BMC CC eighteenth floor तक मिल चुका है. Nineteen to twenty two floor का CC process में है."
 
-Broker Response Handling:
-- INTERESTED:
-  --> "Bahut achha! Kya hum ek site visit schedule kar lein? Kaun sa din aur time sahi rahega?"
-  --> If they give a date/time, use schedule_meeting tool to book it.
-
-- MAYBE:
-  --> "Koi baat nahi. Main aapko complete project details bhej doongi. Kab call back karoon?"
-  --> Use the schedule_callback tool only if they ask for a callback.
-
-- NOT_INTERESTED:
-  --> "Samajh gayi. Agar bura na maanein, specifically kis wajah se?"
-  --> Wait for their answer. When they finish, say goodbye and end the call.
-
+6. BROKER QUALIFICATION & SCHEDULING:
+   Ask: "आप currently किस area में काम कर रहे हैं?"
+   - INTERESTED -> ask date/time -> schedule_meeting
+   - MAYBE -> "कोई बात नहीं. मैं आपको complete project details WhatsApp पर भेज दूँगी. कब call back करूँ?" -> schedule_callback
+   - NOT_INTERESTED -> "समझ गई. अगर बुरा ना मानें, specifically किस वजह से?" -> wait for answer -> end_call
 --- END BROKER FLOW ---
 """
-
 
 INBOUND_INSTRUCTIONS = """
 
 --- INBOUND CALL INSTRUCTIONS ---
 This is an INBOUND CALL -- meaning the person called you.
 Start the call like this:
-1. "Hello, Hookfish mein aapka swagat hai. Main Riya bol rahi hoon. Main aapki kaise madad kar sakti hoon?"
+1. "Hello, Hookfish में आपका स्वागत है। मैं रिया बोल रही हूं। मैं आपकी कैसे मदद कर सकती हूं?"
 2. Listen to their response and proceed accordingly
 3. If they ask about a property, give details
-4. If it's a complaint, listen, note it, and say "humari team 1 din ke andar call back karegi"
+4. If it's a complaint, listen, note it, and say "हमारी team 1 दिन के अंदर call back करेगी"
 --- END INBOUND INSTRUCTIONS ---
 """
 
+
+def build_agent_instructions(is_outbound: bool = False, phone_number: str = None,
+                             contact_type: str = CONTACT_TYPE_BUYER,
+                             caller_name_override: str = None,
+                             target_project: str = None) -> str:
+    """Synchronously hits the DB to build the dynamic instructions string."""
+    # Build dynamic instructions with DB context
+    caller_name = "Sir/Ma'am"
+    db_context = ""
+
+    if phone_number:
+        logger.info(f"Looking up database for phone: {phone_number}")
+        db_context = build_context_from_db(phone_number)
+        logger.info(f"DB context loaded:\n{db_context}")
+
+        # Try to extract name from customer or lead data
+        customer = lookup_customer_by_phone(phone_number)
+        if customer and customer.get("name"):
+            caller_name = customer["name"].strip()
+        else:
+            leads = lookup_lead_by_phone(phone_number)
+            if leads and leads[0].get("partner_name"):
+                caller_name = leads[0]["partner_name"].strip()
+
+    # Override with explicit name if provided
+    if caller_name_override:
+        caller_name = caller_name_override
+        logger.info(f"Using caller name override: {caller_name}")
+
+    # Build instructions based on contact type
+    instructions = BASE_INSTRUCTIONS.replace("{caller_name}", caller_name)
+
+    # Add contact-type specific flow
+    if not is_outbound:
+        instructions += INBOUND_INSTRUCTIONS.replace("{caller_name}", caller_name)
+    elif contact_type == CONTACT_TYPE_BROKER:
+        instructions += BROKER_INSTRUCTIONS.replace("{caller_name}", caller_name)
+    else:
+        instructions += BUYER_INSTRUCTIONS.replace("{caller_name}", caller_name)
+
+    # Add DB context
+    # Check if we have a target project to inject
+    if target_project:
+        db_context += f"\n\n*** TARGET PROJECT FOR THIS CALL ***\n"
+        prop_details = lookup_property_by_name(target_project)
+        if prop_details:
+            for p in prop_details:
+                db_context += f"Project Name: {p['name']}\n"
+                if p.get('commission_percentage'): db_context += f"Commission: {p['commission_percentage']}%\n"
+                if p.get('site_visit_bonus'): db_context += f"Site Bonus: {p['site_visit_bonus']}\n"
+        else:
+            db_context += f"Project Name: {target_project}\n"
+        db_context += "STRICT RULE: YOU MUST ONLY PITCH THIS TARGET PROJECT. Do not mention any other project.\n"
+
+    if db_context.strip():
+        instructions += f"""
+
+--- DATABASE CONTEXT (for this call) ---
+{db_context.strip()}
+---
+Use the above information to personalize the conversation.
+If a TARGET PROJECT is provided, you MUST use it in the PROJECT AWARENESS section instead of the default project.
+If there have been prior leads or interactions, naturally reference them.
+But don't share all information at once -- share as needed.
+"""
+    return instructions
 
 # ============================================================
 # Voice Agent Class
 # ============================================================
 
+class FilteredTTS(smallestai.TTS):
+    """Wrapper to intercept and remove Cerebras LLaMA 3.1 function call leaks before TTS speaks it."""
+    def synthesize(self, text: str, **kwargs):
+        original_text = text
+        
+        # Strip everything starting from these backend keywords (case insensitive)
+        pattern = r'(?i)(function name|capture outcome|parameters outcome|interest level|next action|end call parameters|reason call completed|schedule callback arguments).*'
+        text = re.sub(pattern, '', text, flags=re.DOTALL).strip()
+        
+        if original_text != text:
+            logger.warning(f"Intercepted LLM function call leak in TTS text. Original: '{original_text}' -> Filtered: '{text}'")
+
+        if not text.strip():
+            text = " "  # Avoid empty string error in TTS provider
+            
+        return super().synthesize(text, **kwargs)
+
 class VoiceAgent(Agent):
-    def __init__(self, is_outbound: bool = False, phone_number: str = None,
-                 contact_type: str = CONTACT_TYPE_BUYER,
-                 caller_name_override: str = None) -> None:
-
-        # Build dynamic instructions with DB context
-        caller_name = "Sir/Ma'am"
-        db_context = ""
-
-        if phone_number:
-            logger.info(f"Looking up database for phone: {phone_number}")
-            db_context = build_context_from_db(phone_number)
-            logger.info(f"DB context loaded:\n{db_context}")
-
-            # Try to extract name from customer or lead data
-            customer = lookup_customer_by_phone(phone_number)
-            if customer and customer.get("name"):
-                caller_name = customer["name"].strip()
-            else:
-                leads = lookup_lead_by_phone(phone_number)
-                if leads and leads[0].get("partner_name"):
-                    caller_name = leads[0]["partner_name"].strip()
-
-        # Override with explicit name if provided
-        if caller_name_override:
-            caller_name = caller_name_override
-            logger.info(f"Using caller name override: {caller_name}")
-
-        # Build instructions based on contact type
-        instructions = BASE_INSTRUCTIONS.replace("{caller_name}", caller_name)
-
-        # Add contact-type specific flow
-        if not is_outbound:
-            instructions += INBOUND_INSTRUCTIONS.replace("{caller_name}", caller_name)
-        elif contact_type == CONTACT_TYPE_BROKER:
-            instructions += BROKER_INSTRUCTIONS.replace("{caller_name}", caller_name)
-        else:
-            instructions += BUYER_INSTRUCTIONS.replace("{caller_name}", caller_name)
-
-        # Add DB context
-        if db_context:
-            instructions += f"""
-
---- DATABASE CONTEXT (for this call) ---
-{db_context}
----
-Use the above information to personalize the conversation.
-If property/project details are available, use them in the PROJECT AWARENESS section.
-If there have been prior leads or interactions, naturally reference them.
-But don't share all information at once -- share as needed.
-"""
+    def __init__(self, instructions: str, is_outbound: bool = False, phone_number: str = None,
+                 contact_type: str = CONTACT_TYPE_BUYER) -> None:
 
         logger.info(f"Agent initialized. Contact type: {contact_type}, Outbound: {is_outbound}")
 
         super().__init__(
             instructions=instructions,
-            stt=deepgram.STT(model="nova-2", language="hi"),
-            llm=groq.LLM(model="meta-llama/llama-4-scout-17b-16e-instruct"),
-            tts=elevenlabs.TTS(
-                voice_id="cgSgspJ2msm6clMCkdW9",  # Jessica - default, conversational female
-                model="eleven_multilingual_v2",
-                language="hi",
+            vad=silero.VAD.load(
+                min_silence_duration=0.4,   # Wait 400ms of silence before cutting
+                min_speech_duration=0.15,   # Need 150ms of speech to register as talking
             ),
+            stt=deepgram.STT(
+                model="nova-2",
+                language="hi",
+                interim_results=True,
+                smart_format=False,
+            ),
+            # ULTRA-FAST SWITCH: Using Cerebras for sub-second responses.
+            llm=openai.LLM(
+                model="llama3.1-8b",
+                api_key=os.environ.get("CEREBRAS_API_KEY"),
+                base_url="https://api.cerebras.ai/v1"
+            ),
+            tts=smallestai.TTS(
+                model="lightning-v3.1",
+                voice_id="voice_BTq3OaiWFN",
+                language="hi",
+                sample_rate=16000,
+                base_url="https://api.smallest.ai/waves/v1",
+            ),
+            min_endpointing_delay=0.25,    # Quick 250ms pause detection — fast but not choppy
+            allow_interruptions=True,
         )
         self._is_outbound = is_outbound
         self._phone_number = phone_number
@@ -443,6 +487,7 @@ async def entrypoint(ctx: JobContext):
 
     caller_name_override = None
     call_log_id = None  # Will track this call in agent_call_logs
+    target_project = None
 
     if ctx.job.metadata:
         try:
@@ -450,6 +495,7 @@ async def entrypoint(ctx: JobContext):
             phone_number = dial_info.get("phone_number")
             contact_type = dial_info.get("contact_type", CONTACT_TYPE_BUYER)
             caller_name_override = dial_info.get("caller_name")  # optional name override
+            target_project = dial_info.get("target_project")
             if phone_number:
                 is_outbound = True
                 logger.info(f"Outbound call detected. Target: {phone_number}, Type: {contact_type}, Name: {caller_name_override or 'from DB'}")
@@ -477,9 +523,7 @@ async def entrypoint(ctx: JobContext):
                     caller_name = leads[0]["partner_name"].strip()
 
         if not caller_name or caller_name == "Sir/Ma'am":
-            logger.warning(f"Call NOT allowed to {phone_number}: No contact name found")
-            ctx.shutdown(reason="call_blocked: no_contact_name")
-            return
+            logger.info(f"No contact name found for {phone_number} — using default greeting")
 
     # ---- Create Call Log ----
     if phone_number:
@@ -494,39 +538,15 @@ async def entrypoint(ctx: JobContext):
         # Record the call attempt
         record_call_attempt(phone_number, result="initiated", call_log_id=call_log_id)
 
-    # ---- Outbound: Place the SIP call ----
+    # ---- Pre-build instructions to avoid blocking later ----
+    agent_instructions = ""
     if is_outbound and phone_number:
-        logger.info(f"Placing outbound call to: {phone_number}")
-        lkapi = api.LiveKitAPI(
-            url=os.getenv("LIVEKIT_URL"),
-            api_key=os.getenv("LIVEKIT_API_KEY"),
-            api_secret=os.getenv("LIVEKIT_API_SECRET"),
+        # We MUST connect to the room before the SIP participant can be invited, and before session.start
+        await ctx.connect()
+        logger.info("Building agent instructions from DB (outbound)...")
+        agent_instructions = await asyncio.to_thread(
+            build_agent_instructions, True, phone_number, contact_type, caller_name_override, target_project
         )
-        try:
-            await lkapi.sip.create_sip_participant(
-                api.CreateSIPParticipantRequest(
-                    room_name=ctx.room.name,
-                    sip_trunk_id=sip_trunk_id,
-                    sip_call_to=phone_number,
-                    participant_identity=phone_number,
-                    wait_until_answered=True,
-                )
-            )
-            logger.info("Call picked up successfully")
-            # Update attempt result
-            if phone_number:
-                record_call_attempt(phone_number, result="answered", call_log_id=call_log_id)
-        except Exception as e:
-            logger.error(f"Error placing outbound call: {e}")
-            # Record failed attempt
-            if phone_number:
-                record_call_attempt(phone_number, result="failed", call_log_id=call_log_id)
-            if call_log_id:
-                update_call_log(call_log_id, disposition="failed", notes=f"Call failed: {e}")
-            ctx.shutdown()
-            return
-        finally:
-            await lkapi.aclose()
 
     # ---- Inbound: Wait for SIP participant ----
     else:
@@ -577,10 +597,17 @@ async def entrypoint(ctx: JobContext):
                 room_name=ctx.room.name,
             )
 
-    logger.info(f"Starting agent session. Phone: {phone_number or 'unknown'}, Type: {contact_type}, Outbound: {is_outbound}")
+        logger.info("Building agent instructions from DB (inbound)...")
+        agent_instructions = await asyncio.to_thread(
+            build_agent_instructions, False, phone_number, contact_type, caller_name_override, target_project
+        )
+
+    logger.info(f"Starting agent session. Phone: {phone_number or 'unknown'}, Type: {contact_type}, Outbound: {is_outbound}, Target: {target_project}")
 
     # ---- Transcript collector ----
     transcript_messages = []
+    call_start_time = time.time()  # Track when the call actually starts
+    MIN_CALL_BEFORE_OUTCOME = 30   # Minimum seconds before capture_outcome/end_call are allowed
 
     # ---- Define Function Tools ----
 
@@ -588,24 +615,29 @@ async def entrypoint(ctx: JobContext):
         name="end_call",
         description="Ends the current call. Use this AFTER capture_outcome, or when the user says goodbye."
     )
-    async def end_call(reason: str = "call_completed") -> str:
+    async def end_call(reason: str | None = "call_completed") -> str:
         """End the call and disconnect.
 
         Args:
             reason: The reason for ending the call, e.g. 'user_requested', 'call_completed', 'max_duration', 'wrong_number', 'dnc_requested'
         """
+        elapsed = time.time() - call_start_time
+        if elapsed < MIN_CALL_BEFORE_OUTCOME:
+            logger.warning(f"end_call BLOCKED — only {elapsed:.0f}s into call (min {MIN_CALL_BEFORE_OUTCOME}s). Greet the caller first!")
+            return ""
+
         logger.info(f"end_call tool invoked. Reason: {reason}")
 
         # Save transcript and update call log
         if call_log_id:
-            duration = int(time.time() - time.time())  # Will be updated properly
+            duration = int(time.time() - call_start_time)
             try:
                 transcript_text = "\n".join(
                     [f"{m['role']}: {m['text']}" for m in transcript_messages]
                 )
                 update_call_log(
                     call_log_id,
-                    duration_seconds=int(time.time() - agent_start_time) if 'agent_start_time' in dir() else 0,
+                    duration_seconds=duration,
                     transcript=transcript_text,
                     notes=f"Call ended. Reason: {reason}",
                 )
@@ -622,22 +654,23 @@ async def entrypoint(ctx: JobContext):
                 logger.error(f"Error during shutdown: {e}")
 
         asyncio.create_task(_shutdown_after_delay())
-        return "Say goodbye politely and provide a summary of the next steps. The call is ending."
+        return "[SILENT] Done. Say goodbye naturally."
 
     @function_tool(
         name="capture_outcome",
         description=(
-            "Use this to save the call outcome and interest level. "
-            "You MUST use this at the end of EVERY call. "
+            "ONLY use this when the call is ENDING — NEVER at the start or middle of a call. "
+            "You must have had a full conversation before using this. "
+            "Use this to save the final call outcome and interest level. "
             "outcome values: 'interested', 'maybe', 'not_interested', 'callback_requested', 'escalated', 'dnc', 'wrong_number'. "
             "interest_level values: 'high', 'medium', 'low', 'none'."
         )
     )
     async def capture_outcome(
         outcome: str,
-        reason: str = "",
-        interest_level: str = "unknown",
-        next_action: str = "",
+        reason: str | None = None,
+        interest_level: str | None = "unknown",
+        next_action: str | None = None,
     ) -> str:
         """Save the call outcome, interest level, and reason to the database.
 
@@ -647,6 +680,10 @@ async def entrypoint(ctx: JobContext):
             interest_level: How interested they are - 'high', 'medium', 'low', 'none'
             next_action: What should happen next - 'callback', 'site_visit', 'send_details', 'escalate', 'none'
         """
+        elapsed = time.time() - call_start_time
+        if elapsed < MIN_CALL_BEFORE_OUTCOME:
+            logger.warning(f"capture_outcome BLOCKED — only {elapsed:.0f}s into call (min {MIN_CALL_BEFORE_OUTCOME}s). Greet the caller first!")
+            return ""
         logger.info(
             f"capture_outcome invoked. Phone: {phone_number}, "
             f"Outcome: {outcome}, Reason: {reason}, "
@@ -684,7 +721,7 @@ async def entrypoint(ctx: JobContext):
                 next_action=next_action,
             )
 
-        return f"Outcome saved: {outcome}. Now end the call naturally."
+        return "[SILENT] Done."
 
     @function_tool(
         name="schedule_callback",
@@ -694,9 +731,9 @@ async def entrypoint(ctx: JobContext):
         )
     )
     async def schedule_callback(
-        callback_date: str = "",
-        callback_time: str = "",
-        notes: str = "",
+        callback_date: str | None = None,
+        callback_time: str | None = None,
+        notes: str | None = None,
     ) -> str:
         """Schedule a callback or follow-up for later.
 
@@ -705,6 +742,11 @@ async def entrypoint(ctx: JobContext):
             callback_time: Time for callback, e.g. 'shaam 5 baje', '3 PM'
             notes: Any additional notes about the callback
         """
+        elapsed = time.time() - call_start_time
+        if elapsed < MIN_CALL_BEFORE_OUTCOME:
+            logger.warning(f"schedule_callback BLOCKED — only {elapsed:.0f}s into call. Greet first!")
+            return ""
+
         callback_info = f"Date: {callback_date}, Time: {callback_time}"
         if notes:
             callback_info += f", Notes: {notes}"
@@ -727,7 +769,7 @@ async def entrypoint(ctx: JobContext):
                 notes=f"Callback scheduled: {callback_info}",
             )
 
-        return f"Callback scheduled: {callback_info}. Confirm this with the user."
+        return "[SILENT] Done."
 
     @function_tool(
         name="mark_as_dnc",
@@ -737,12 +779,17 @@ async def entrypoint(ctx: JobContext):
             "Examples: 'mujhe call mat karo', 'remove me from your list', 'don't call again'."
         )
     )
-    async def mark_as_dnc(reason: str = "user_requested") -> str:
+    async def mark_as_dnc(reason: str | None = "user_requested") -> str:
         """Mark the current phone number as Do Not Call.
 
         Args:
             reason: Why they want to be removed, e.g. 'user_requested', 'not_interested_permanent'
         """
+        elapsed = time.time() - call_start_time
+        if elapsed < MIN_CALL_BEFORE_OUTCOME:
+            logger.warning(f"mark_as_dnc BLOCKED — only {elapsed:.0f}s into call. Greet first!")
+            return ""
+
         logger.info(f"mark_as_dnc invoked. Phone: {phone_number}, Reason: {reason}")
 
         if phone_number:
@@ -756,7 +803,7 @@ async def entrypoint(ctx: JobContext):
                 notes=f"DNC marked. Reason: {reason}",
             )
 
-        return "Number marked as Do Not Call. Now apologize politely and end the call."
+        return "[SILENT] Done."
 
     @function_tool(
         name="schedule_meeting",
@@ -767,12 +814,12 @@ async def entrypoint(ctx: JobContext):
         )
     )
     async def schedule_meeting(
-        meeting_date: str = "",
-        meeting_time: str = "",
-        meeting_type: str = "site_visit",
-        project_name: str = "",
-        location: str = "",
-        notes: str = "",
+        meeting_date: str | None = None,
+        meeting_time: str | None = None,
+        meeting_type: str | None = "site_visit",
+        project_name: str | None = None,
+        location: str | None = None,
+        notes: str | None = None,
     ) -> str:
         """Schedule a meeting/site visit and auto-allocate a manager.
 
@@ -784,108 +831,228 @@ async def entrypoint(ctx: JobContext):
             location: Meeting location if known
             notes: Any additional notes
         """
+        elapsed = time.time() - call_start_time
+        if elapsed < MIN_CALL_BEFORE_OUTCOME:
+            logger.warning(f"schedule_meeting BLOCKED — only {elapsed:.0f}s into call. Greet first!")
+            return ""
+
         logger.info(f"schedule_meeting invoked. Phone: {phone_number}, Date: {meeting_date}, Time: {meeting_time}")
 
-        # Auto-allocate a manager (round-robin)
-        manager = allocate_manager(project_name=project_name or None)
-        manager_name = manager["name"] if manager else None
-        manager_id = manager["id"] if manager else None
+        try:
+            start_dt, _ = parse_meeting_datetime(meeting_date, meeting_time)
+            clean_date = start_dt.strftime("%Y-%m-%d")
+            clean_time = start_dt.strftime("%H:%M:%S")
+        except Exception as e:
+            logger.warning(f"Failed to parse datetime for DB: {e}")
+            clean_date, clean_time = meeting_date, meeting_time
 
-        # Get caller name
-        caller_name = caller_name_override
-        if not caller_name and phone_number:
+        def _bg_task():
+            # Auto-allocate a manager (round-robin)
+            manager = allocate_manager(project_name=project_name or None)
+            manager_name = manager["name"] if manager else None
+            manager_id = manager["id"] if manager else None
+
+            # Get caller name
+            caller_name = caller_name_override
+            if not caller_name and phone_number:
+                customer = lookup_customer_by_phone(phone_number)
+                if customer:
+                    caller_name = customer.get("name")
+
+            # Create meeting record
+            meeting_id = None
+            if phone_number:
+                try:
+                    meeting_id = create_meeting(
+                        phone_number=phone_number,
+                        contact_name=caller_name,
+                        contact_type=contact_type,
+                        meeting_type=meeting_type,
+                        meeting_date=clean_date,
+                        meeting_time=clean_time,
+                        location=location,
+                        project_name=project_name,
+                        manager_id=manager_id,
+                        manager_name=manager_name,
+                        call_log_id=call_log_id,
+                        notes=notes,
+                    )
+                except Exception as db_err:
+                    logger.error(f"Error creating meeting in DB: {db_err}")
+
+            # Update call log
+            if call_log_id:
+                try:
+                    update_call_log(
+                        call_log_id,
+                        next_action="site_visit" if meeting_type == "site_visit" else "meeting",
+                        manager_assigned=manager_name,
+                        notes=f"Meeting ({meeting_type}) scheduled: {clean_date} {clean_time}. Manager: {manager_name or 'TBD'}",
+                    )
+                except Exception as log_err:
+                    logger.error(f"Error updating call log: {log_err}")
+
+            # ---- Google Calendar Integration ----
+            try:
+                manager_email = get_manager_email(manager_id) if manager_id else None
+
+                cal_result = schedule_meeting_on_calendar(
+                    contact_name=caller_name or "Contact",
+                    contact_phone=phone_number or "",
+                    contact_type=contact_type,
+                    meeting_type=meeting_type,
+                    date_str=meeting_date,
+                    time_str=meeting_time,
+                    project_name=project_name,
+                    location=location,
+                    manager_name=manager_name or "",
+                    manager_email=manager_email or "",
+                    notes=notes,
+                )
+
+                if cal_result["success"] and cal_result["event_id"]:
+                    if meeting_id:
+                        update_meeting_calendar(
+                            meeting_id,
+                            calendar_event_id=cal_result["event_id"],
+                            calendar_invite_sent=True,
+                        )
+                    logger.info(f"Calendar event created: {cal_result['event_id']}")
+                elif not cal_result["available"]:
+                    logger.warning(f"Calendar slot unavailable: {cal_result['message']}")
+                else:
+                    logger.warning(f"Calendar event creation failed: {cal_result['message']}")
+            except Exception as e:
+                logger.error(f"Error creating calendar event: {e}")
+
+        # Run heavily blocking DB/HTTP logic in background thread!
+        asyncio.create_task(asyncio.to_thread(_bg_task))
+        return "[SILENT] Done."
+        #
+        #         wa_result = send_and_log_meeting_details(
+        #             to_phone=phone_number,
+        #             contact_name=caller_name or "Customer",
+        #             meeting_type=meeting_type,
+        #             meeting_date=meeting_date,
+        #             meeting_time=meeting_time,
+        #             project_name=project_name,
+        #             location=location,
+        #             manager_name=manager_name or "",
+        #             manager_phone=manager_phone_num,
+        #             notes=notes,
+        #             meeting_id=meeting_id,
+        #             call_log_id=call_log_id,
+        #         )
+        #
+        #         if wa_result.get("success"):
+        #             whatsapp_msg = " Meeting details have been sent to WhatsApp."
+        #             logger.info(f"WhatsApp meeting confirmation sent to {phone_number}")
+        #         else:
+        #             whatsapp_msg = " WhatsApp message could not be sent, but meeting is saved."
+        #             logger.warning(f"WhatsApp send failed for {phone_number}: {wa_result.get('message')}")
+        # except Exception as e:
+        #     logger.error(f"Error sending WhatsApp meeting confirmation: {e}")
+        #     whatsapp_msg = " Meeting saved (WhatsApp notification pending)."
+
+        # Return minimal silent response — agent must NOT read this aloud
+        return "[SILENT] Done."
+
+    # ---- WhatsApp Tool: Send details on demand ----
+
+    @function_tool(
+        name="send_whatsapp_details",
+        description=(
+            "Send meeting details or project brochure info to the contact via WhatsApp. "
+            "Use this when the contact says 'send me details on WhatsApp', "
+            "'WhatsApp kar do', 'details bhej do', etc. "
+            "Also used automatically after scheduling a meeting."
+        )
+    )
+    async def send_whatsapp_details(
+        message_type: str | None = "project_details",
+        project_name: str | None = None,
+        project_location: str | None = None,
+        price_info: str | None = None,
+        notes: str | None = None,
+    ) -> str:
+        """Send meeting or project details to the contact via WhatsApp.
+
+        Args:
+            message_type: What to send - 'project_details' or 'meeting_confirmation'
+            project_name: Name of the project/property
+            project_location: Location of the project
+            price_info: Price or payment plan info
+            notes: Any additional notes to include
+        """
+        logger.info(f"send_whatsapp_details invoked. Phone: {phone_number}, Type: {message_type}")
+
+        if not phone_number:
+            return "Cannot send WhatsApp: no phone number available for this call."
+
+        # Get the caller name
+        wa_caller_name = caller_name_override
+        if not wa_caller_name and phone_number:
             customer = lookup_customer_by_phone(phone_number)
             if customer:
-                caller_name = customer.get("name")
+                wa_caller_name = customer.get("name", "Customer")
+        wa_caller_name = wa_caller_name or "Customer"
 
-        # Create meeting record
-        meeting_id = None
-        if phone_number:
-            meeting_id = create_meeting(
-                phone_number=phone_number,
-                contact_name=caller_name,
-                contact_type=contact_type,
-                meeting_type=meeting_type,
-                meeting_date=meeting_date,
-                meeting_time=meeting_time,
-                location=location,
-                project_name=project_name,
-                manager_id=manager_id,
-                manager_name=manager_name,
-                call_log_id=call_log_id,
-                notes=notes,
-            )
-
-        # Update call log
-        if call_log_id:
-            update_call_log(
-                call_log_id,
-                next_action="site_visit" if meeting_type == "site_visit" else "meeting",
-                manager_assigned=manager_name,
-                notes=f"Meeting ({meeting_type}) scheduled: {meeting_date} {meeting_time}. Manager: {manager_name or 'TBD'}",
-            )
-
-        # ---- Google Calendar Integration ----
-        calendar_msg = ""
         try:
-            manager_email = get_manager_email(manager_id) if manager_id else None
-
-            cal_result = schedule_meeting_on_calendar(
-                contact_name=caller_name or "Contact",
-                contact_phone=phone_number or "",
-                contact_type=contact_type,
-                meeting_type=meeting_type,
-                date_str=meeting_date,
-                time_str=meeting_time,
-                project_name=project_name,
-                location=location,
-                manager_name=manager_name or "",
-                manager_email=manager_email or "",
-                notes=notes,
-            )
-
-            if cal_result["success"] and cal_result["event_id"]:
-                # Save calendar event ID to the meeting record
-                if meeting_id:
-                    update_meeting_calendar(
-                        meeting_id,
-                        calendar_event_id=cal_result["event_id"],
-                        calendar_invite_sent=True,
-                    )
-                calendar_msg = f" Calendar invite has been created for {cal_result['start']}."
-                logger.info(f"Calendar event created: {cal_result['event_id']}")
-            elif not cal_result["available"]:
-                calendar_msg = f" Note: {cal_result['message']}"
-                logger.warning(f"Calendar slot unavailable: {cal_result['message']}")
+            if message_type == "project_details":
+                result = send_and_log_project_details(
+                    to_phone=phone_number,
+                    contact_name=wa_caller_name,
+                    project_name=project_name or "Maanikya",
+                    project_location=project_location or "Opposite Jimmy Boy Bakery, Desai Park, माहिम West, South Bombay",
+                    project_type="Residential - 2 BHK (Redevelopment)",
+                    key_highlights=[
+                        "South Bombay prime location - Mahim West",
+                        "Walking distance to Railway Station & Shitla Devi Metro Station",
+                        "Developed by Viyan Ventures (Mr. Nayan Gandhi & Mr. Rohan Jain)",
+                        "Pay 50 lakh now, no further payments until possession",
+                        "11th slab complete out of 23 (Miven Technology)",
+                        "BMC CC received up to 18th floor",
+                        "13th floor & above available for new buyers",
+                        "2BHK (604 sqft) - 2.57 Cr | 2BHK (619 sqft) - 2.67 Cr (All-inclusive)",
+                        "RERA Possession: 2029",
+                    ],
+                    price_info=price_info or "2BHK 604sqft: 2.57Cr | 2BHK 619sqft: 2.67Cr (All-inclusive). Pay 50L now, rest at possession.",
+                    contact_type=contact_type,
+                    call_log_id=call_log_id,
+                )
             else:
-                calendar_msg = " Calendar invite could not be sent, but meeting is saved."
-                logger.warning(f"Calendar event creation failed: {cal_result['message']}")
+                result = send_and_log_meeting_details(
+                    to_phone=phone_number,
+                    contact_name=wa_caller_name,
+                    meeting_type="site_visit",
+                    meeting_date="TBD",
+                    meeting_time="TBD",
+                    project_name=project_name,
+                    notes=notes,
+                    call_log_id=call_log_id,
+                )
+
+            if result.get("success"):
+                logger.info(f"WhatsApp details sent to {phone_number}")
+                return "[SILENT] Done."
+            else:
+                logger.warning(f"WhatsApp send failed: {result.get('message')}")
+                return "[SILENT] Done."
+
         except Exception as e:
-            logger.error(f"Error creating calendar event: {e}")
-            calendar_msg = " Meeting saved in database (calendar sync pending)."
-
-        # Build response for the agent
-        response = f"Meeting scheduled for {meeting_date}"
-        if meeting_time:
-            response += f" at {meeting_time}"
-        if manager_name:
-            response += f". Manager {manager_name} has been assigned."
-        else:
-            response += ". A manager will be assigned shortly."
-        response += calendar_msg
-        response += " Confirm the details with the caller."
-
-        return response
+            logger.error(f"Error in send_whatsapp_details: {e}")
+            return "[SILENT] Done."
 
     # ---- Create Agent Session ----
     session = AgentSession(
         allow_interruptions=True,
-        min_interruption_duration=0.3,  # Faster interrupt detection
-        min_interruption_words=1,
-        min_endpointing_delay=0.3,      # Faster response time
-        max_endpointing_delay=1.3,
-        preemptive_generation=True,
-        tools=[end_call, capture_outcome, schedule_callback, mark_as_dnc, schedule_meeting],
+        min_interruption_duration=0.5,   # Need 500ms of speech to interrupt (avoids noise/cough triggers)
+        min_interruption_words=1,       # Must say at least 1 word to interrupt (not just sounds)
+        min_endpointing_delay=0.25,     # Quick response after user stops
+        max_endpointing_delay=0.8,      # Max 800ms wait for mid-sentence pauses
+        preemptive_generation=True,     # Re-enabled: Sweden Central is faster, preemptive helps!
+        aec_warmup_duration=0,          # Disable 3s initialization delay
+        tools=[schedule_callback, mark_as_dnc, schedule_meeting], # temporarily removed end_call, capture_outcome
     )
 
     # ---- Track transcript ----
@@ -900,13 +1067,15 @@ async def entrypoint(ctx: JobContext):
         transcript_messages.append({"role": "user", "text": str(msg)})
 
     # ---- Start Session ----
+    voice_agent = VoiceAgent(
+        instructions=agent_instructions,
+        is_outbound=is_outbound,
+        phone_number=phone_number,
+        contact_type=contact_type,
+    )
+    
     await session.start(
-        agent=VoiceAgent(
-            is_outbound=is_outbound,
-            phone_number=phone_number,
-            contact_type=contact_type,
-            caller_name_override=caller_name_override,
-        ),
+        agent=voice_agent,
         room=ctx.room,
     )
 
@@ -940,6 +1109,54 @@ async def entrypoint(ctx: JobContext):
             logger.error(f"Error during auto-end: {e}")
 
     asyncio.create_task(_auto_end_timer())
+
+    # ---- Outbound: Place the SIP call ----
+    if is_outbound and phone_number:
+        logger.info(f"Placing outbound call to: {phone_number}")
+        lkapi = api.LiveKitAPI(
+            url=os.getenv("LIVEKIT_URL"),
+            api_key=os.getenv("LIVEKIT_API_KEY"),
+            api_secret=os.getenv("LIVEKIT_API_SECRET"),
+        )
+        try:
+            await lkapi.sip.create_sip_participant(
+                api.CreateSIPParticipantRequest(
+                    room_name=ctx.room.name,
+                    sip_trunk_id=sip_trunk_id,
+                    sip_call_to=phone_number,
+                    participant_identity=phone_number,
+                    wait_until_answered=True,
+                )
+            )
+            logger.info("Call picked up successfully! Triggering agent greeting.")
+            if phone_number:
+                record_call_attempt(phone_number, result="answered", call_log_id=call_log_id)
+                
+            # Wait a brief moment for the audio track to stabilize, then greet!
+            async def trigger_greeting():
+                logger.info("Agent playing initial outbound greeting directly via TTS...")
+                c_name = caller_name if 'caller_name' in locals() and caller_name else "सर/मैडम"
+                try:
+                    # Warm, casual greeting — like calling a friend
+                    await voice_agent.session.say(f"हेलो, {c_name} जी!", add_to_chat_ctx=True)
+                    await voice_agent.session.say("कैसे हैं आप? सब बढ़िया?", add_to_chat_ctx=True)
+                except AttributeError:
+                    # Fallback if say doesn't exist or isn't async
+                    import livekit.agents.llm as llm_model
+                    voice_agent.session.chat_ctx.messages.append(llm_model.ChatMessage(role="assistant", content=f"नमस्ते {c_name} जी, कैसे हैं आप?"))
+                    await voice_agent.session.generate_reply()
+            asyncio.create_task(trigger_greeting())
+            
+        except Exception as e:
+            logger.error(f"Error placing outbound call: {e}")
+            # Record failed attempt
+            if phone_number:
+                record_call_attempt(phone_number, result="failed", call_log_id=call_log_id)
+            if call_log_id:
+                update_call_log(call_log_id, disposition="failed", notes=f"Call failed: {e}")
+            ctx.shutdown()
+        finally:
+            await lkapi.aclose()
 
 
 if __name__ == "__main__":
