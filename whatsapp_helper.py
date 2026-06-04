@@ -20,6 +20,8 @@
 import os
 import logging
 import json
+import time
+import random
 import requests
 from datetime import datetime
 from dotenv import load_dotenv
@@ -46,6 +48,28 @@ BUSINESS_NAME = os.getenv("WHATSAPP_BUSINESS_NAME", "Hookfish")
 
 # Default country code for phone numbers
 DEFAULT_COUNTRY_CODE = "91"
+
+# ── Retry configuration ───────────────────────────────────────────────────
+# Max attempts for a single send (1 = no retry, 3 = 2 retries after first try)
+WHATSAPP_MAX_RETRIES  = int(os.getenv("WHATSAPP_MAX_RETRIES",  "3"))
+# Base backoff in seconds — doubles each attempt, ±25 % jitter applied
+WHATSAPP_RETRY_BASE   = float(os.getenv("WHATSAPP_RETRY_BASE", "2.0"))
+# Cap on how long we'll wait between retries (seconds)
+WHATSAPP_RETRY_CAP    = float(os.getenv("WHATSAPP_RETRY_CAP",  "30.0"))
+
+# HTTP status codes that are worth retrying:
+#   429 — rate limited (we respect Retry-After header)
+#   500, 502, 503, 504 — transient server errors on Meta's side
+_RETRYABLE_HTTP_CODES = {429, 500, 502, 503, 504}
+
+# Meta error codes that are NOT worth retrying (permanent failures):
+#   130429 — rate limit hit but token is permanently blocked: don't retry
+#   131047 — message failed to send (re-engagement required)
+#   131051 — template not approved — retrying won't help
+#   131052 — template param count wrong — retrying won't help
+#   190    — access token expired / invalid
+#   100    — parameter invalid (bad phone number, etc.)
+_NON_RETRYABLE_META_CODES = {131047, 131051, 131052, 190, 100}
 
 
 # ============================================================
@@ -91,48 +115,159 @@ def _get_headers() -> dict:
 
 def _send_whatsapp_request(payload: dict) -> dict:
     """
-    Send a request to the WhatsApp Cloud API.
-    Returns the API response as a dict.
+    Send a request to the WhatsApp Cloud API with exponential backoff retry.
+
+    Retry policy:
+      - Retried:     HTTP 429 (rate limit), 500/502/503/504 (server errors),
+                     network timeouts and connection errors.
+      - Not retried: HTTP 400/401/403/404 (client errors), and specific Meta
+                     error codes that indicate permanent failure
+                     (expired token, unapproved template, bad phone number).
+
+    On a 429 response the Retry-After header is respected if present;
+    otherwise exponential backoff with ±25 % jitter is used.
+    Each attempt and its outcome is logged at the appropriate level so
+    failures are traceable without noise on the first successful send.
+
+    Returns a dict with keys: success, message_id, error, error_code,
+    attempts, response.
     """
     if not WHATSAPP_TOKEN:
         logger.error("WHATSAPP_TOKEN is not set. Cannot send WhatsApp message.")
-        return {"success": False, "error": "WHATSAPP_TOKEN not configured"}
+        return {"success": False, "error": "WHATSAPP_TOKEN not configured", "attempts": 0}
 
     if not WHATSAPP_PHONE_NUMBER_ID:
         logger.error("WHATSAPP_PHONE_NUMBER_ID is not set. Cannot send WhatsApp message.")
-        return {"success": False, "error": "WHATSAPP_PHONE_NUMBER_ID not configured"}
+        return {"success": False, "error": "WHATSAPP_PHONE_NUMBER_ID not configured", "attempts": 0}
 
     url = f"{WHATSAPP_API_BASE}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+    last_result = {}
 
-    try:
-        response = requests.post(url, headers=_get_headers(), json=payload, timeout=30)
-        result = response.json()
+    for attempt in range(1, WHATSAPP_MAX_RETRIES + 1):
+        try:
+            response = requests.post(
+                url, headers=_get_headers(), json=payload, timeout=30
+            )
+            result = response.json()
+            status = response.status_code
 
-        if response.status_code == 200:
-            message_id = result.get("messages", [{}])[0].get("id", "")
-            logger.info(f"WhatsApp message sent successfully. Message ID: {message_id}")
-            return {
-                "success": True,
-                "message_id": message_id,
-                "response": result,
-            }
-        else:
-            error_msg = result.get("error", {}).get("message", "Unknown error")
-            error_code = result.get("error", {}).get("code", "")
-            logger.error(f"WhatsApp API error ({error_code}): {error_msg}")
-            return {
-                "success": False,
-                "error": error_msg,
+            # ── Success ───────────────────────────────────────────
+            if status == 200:
+                message_id = result.get("messages", [{}])[0].get("id", "")
+                if attempt > 1:
+                    logger.info(
+                        f"WhatsApp message sent on attempt {attempt}. "
+                        f"Message ID: {message_id}"
+                    )
+                else:
+                    logger.info(f"WhatsApp message sent. Message ID: {message_id}")
+                return {
+                    "success":    True,
+                    "message_id": message_id,
+                    "response":   result,
+                    "attempts":   attempt,
+                }
+
+            # ── API-level error ───────────────────────────────────
+            error_info = result.get("error", {})
+            error_msg  = error_info.get("message", "Unknown error")
+            error_code = error_info.get("code", 0)
+
+            last_result = {
+                "success":    False,
+                "error":      error_msg,
                 "error_code": error_code,
-                "response": result,
+                "response":   result,
+                "attempts":   attempt,
             }
 
-    except requests.exceptions.Timeout:
-        logger.error("WhatsApp API request timed out")
-        return {"success": False, "error": "Request timed out"}
-    except requests.exceptions.RequestException as e:
-        logger.error(f"WhatsApp API request failed: {e}")
-        return {"success": False, "error": str(e)}
+            # Non-retryable Meta error codes
+            if error_code in _NON_RETRYABLE_META_CODES:
+                logger.error(
+                    f"WhatsApp permanent failure (code {error_code}): {error_msg}"
+                )
+                return last_result
+
+            # Non-retryable HTTP status codes (4xx except 429)
+            if status not in _RETRYABLE_HTTP_CODES:
+                logger.error(
+                    f"WhatsApp API error HTTP {status} (code {error_code}): {error_msg}"
+                )
+                return last_result
+
+            # ── Retryable error ───────────────────────────────────
+            if attempt == WHATSAPP_MAX_RETRIES:
+                # Exhausted — log final failure and return
+                logger.error(
+                    f"WhatsApp failed after {attempt} attempt(s). "
+                    f"HTTP {status} (code {error_code}): {error_msg}"
+                )
+                return last_result
+
+            # Compute wait time
+            if status == 429:
+                # Respect Retry-After if present (Meta sometimes sets it)
+                retry_after = response.headers.get("Retry-After")
+                if retry_after:
+                    wait = min(float(retry_after), WHATSAPP_RETRY_CAP)
+                    logger.warning(
+                        f"WhatsApp rate limited (429). "
+                        f"Retry-After={wait}s. Attempt {attempt}/{WHATSAPP_MAX_RETRIES}."
+                    )
+                else:
+                    wait = min(
+                        WHATSAPP_RETRY_BASE * (2 ** (attempt - 1)),
+                        WHATSAPP_RETRY_CAP,
+                    ) * random.uniform(0.75, 1.25)
+                    logger.warning(
+                        f"WhatsApp rate limited (429). "
+                        f"Backing off {wait:.1f}s. Attempt {attempt}/{WHATSAPP_MAX_RETRIES}."
+                    )
+            else:
+                wait = min(
+                    WHATSAPP_RETRY_BASE * (2 ** (attempt - 1)),
+                    WHATSAPP_RETRY_CAP,
+                ) * random.uniform(0.75, 1.25)
+                logger.warning(
+                    f"WhatsApp transient error HTTP {status}: {error_msg}. "
+                    f"Retrying in {wait:.1f}s. Attempt {attempt}/{WHATSAPP_MAX_RETRIES}."
+                )
+
+            time.sleep(wait)
+
+        except requests.exceptions.Timeout:
+            last_result = {"success": False, "error": "Request timed out", "attempts": attempt}
+            if attempt == WHATSAPP_MAX_RETRIES:
+                logger.error(
+                    f"WhatsApp request timed out after {attempt} attempt(s)."
+                )
+                return last_result
+            wait = min(
+                WHATSAPP_RETRY_BASE * (2 ** (attempt - 1)), WHATSAPP_RETRY_CAP
+            ) * random.uniform(0.75, 1.25)
+            logger.warning(
+                f"WhatsApp request timeout. "
+                f"Retrying in {wait:.1f}s. Attempt {attempt}/{WHATSAPP_MAX_RETRIES}."
+            )
+            time.sleep(wait)
+
+        except requests.exceptions.RequestException as exc:
+            last_result = {"success": False, "error": str(exc), "attempts": attempt}
+            if attempt == WHATSAPP_MAX_RETRIES:
+                logger.error(
+                    f"WhatsApp request failed after {attempt} attempt(s): {exc}"
+                )
+                return last_result
+            wait = min(
+                WHATSAPP_RETRY_BASE * (2 ** (attempt - 1)), WHATSAPP_RETRY_CAP
+            ) * random.uniform(0.75, 1.25)
+            logger.warning(
+                f"WhatsApp connection error: {exc}. "
+                f"Retrying in {wait:.1f}s. Attempt {attempt}/{WHATSAPP_MAX_RETRIES}."
+            )
+            time.sleep(wait)
+
+    return last_result
 
 
 # ============================================================
@@ -639,34 +774,25 @@ def log_whatsapp_message(
         Log entry ID or None on failure
     """
     import uuid
-    import pymysql
+    from db_helper import get_connection
 
     log_id = str(uuid.uuid4())
     try:
-        conn = pymysql.connect(
-            host=os.getenv("DB_HOST"),
-            port=int(os.getenv("DB_PORT")),
-            user=os.getenv("DB_USER"),
-            password=os.getenv("DB_PASSWORD"),
-            database=os.getenv("DB_NAME"),
-            ssl={"ssl": {}},
-            cursorclass=pymysql.cursors.DictCursor,
-        )
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO agent_whatsapp_logs
-                    (id, phone_number, message_type, template_name,
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO agent_whatsapp_logs
+                        (id, phone_number, message_type, template_name,
+                         message_content, whatsapp_message_id, status,
+                         meeting_id, call_log_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (log_id, phone_number, message_type, template_name,
                      message_content, whatsapp_message_id, status,
-                     meeting_id, call_log_id)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                (log_id, phone_number, message_type, template_name,
-                 message_content, whatsapp_message_id, status,
-                 meeting_id, call_log_id),
-            )
-            conn.commit()
-        conn.close()
+                     meeting_id, call_log_id),
+                )
+                conn.commit()
         logger.info(f"Logged WhatsApp message {log_id} to {phone_number}")
         return log_id
     except Exception as e:

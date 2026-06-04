@@ -4,44 +4,66 @@ import os
 import json
 import re
 import time
+
 from dotenv import load_dotenv
+
+# Load environment variables FIRST
+load_dotenv()
+
+# Bypass proxy lookups on Windows (avoids slow HTTPx startup)
+os.environ["NO_PROXY"] = "*"
+os.environ["HTTPX_NO_PROXIES"] = "1"
 
 from livekit.agents import JobContext, WorkerOptions, cli, get_job_context
 from livekit.agents.voice import Agent, AgentSession
 from livekit.agents.llm import function_tool
-from livekit.plugins import silero, groq, deepgram, sarvam, elevenlabs, azure, cartesia, smallestai, openai
+from livekit.plugins import silero, deepgram, smallestai, openai, groq
 from livekit import api, rtc
-from openai import AsyncAzureOpenAI
-import httpx
 
-# Load environment variables FIRST
-from dotenv import load_dotenv
-load_dotenv()
-
-# Bypass proxy lookups on Windows which causes slow HTTPx startup for API connections
-os.environ["NO_PROXY"] = "*"
-os.environ["HTTPX_NO_PROXIES"] = "1"
-
+from db_helper import (
     get_connection,
     get_agent_context_optimized,
+    lookup_customer_by_phone,
+    save_call_outcome,
+    create_call_log,
+    update_call_log,
+    record_call_attempt,
+    allocate_manager,
+    create_meeting,
+    get_meetings_for_phone,
+    update_meeting_calendar,
+    get_manager_email,
+    get_project_script,
+    get_project_facts,
+    add_project_details_column,
 )
+from db_helper import mark_dnc as db_mark_dnc
 
-from google_calendar import schedule_meeting_on_calendar, parse_meeting_datetime
+from google_calendar import schedule_meeting_on_calendar, parse_meeting_datetime, validate_calendar_config, CalendarConfigError
 
-
-# Load environment variables
-load_dotenv()
-
-# Logging setup
+# Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("voice-agent")
 logging.getLogger("livekit.agents").setLevel(logging.DEBUG)
 
+# Ensure properties.details column exists (safe no-op if already present)
+add_project_details_column()
+
+# Validate Google Calendar config at startup so misconfiguration surfaces
+# immediately in the worker log rather than mid-call as an obscure auth failure.
+# A CalendarConfigError means meetings will be DB-only until the config is fixed.
+try:
+    validate_calendar_config()
+except CalendarConfigError as _cal_err:
+    logger.warning(
+        f"Google Calendar is misconfigured — meetings will be saved to DB only "
+        f"until this is resolved.\n{_cal_err}"
+    )
+
 # ============================================================
 # Constants
 # ============================================================
-MAX_CALL_DURATION = 240      # 4 minutes (hard cutoff)
-WRAP_UP_WARNING = 210        # 3.5 minutes (tell agent to wrap up)
+MAX_CALL_DURATION = 240
 CONTACT_TYPE_BUYER = "buyer"
 CONTACT_TYPE_BROKER = "broker"
 
@@ -50,19 +72,9 @@ CONTACT_TYPE_BROKER = "broker"
 # Database Context Builder
 # ============================================================
 def build_context_from_db(phone_number: str, pre_fetched_data: dict = None) -> str:
-    """
-    Build a context string from DB data.
-    Uses pre_fetched_data if provided to avoid new DB calls.
-    """
     context_parts = []
-    
-    if pre_fetched_data:
-        data = pre_fetched_data
-    else:
-        # Fallback to slow fetch if no pre-fetched data
-        data = get_agent_context_optimized(phone_number)
+    data = pre_fetched_data or get_agent_context_optimized(phone_number)
 
-    # 1. Customer
     customer = data.get("customer")
     if customer:
         context_parts.append(
@@ -70,37 +82,36 @@ def build_context_from_db(phone_number: str, pre_fetched_data: dict = None) -> s
             f"ID = {customer['id']}, Source = {customer.get('origin', 'N/A')}"
         )
 
-    # 2. Leads
     leads = data.get("leads", [])
     if leads:
         context_parts.append(f"\nFound {len(leads)} leads for this number:")
         for lead in leads:
-            lead_info = (
+            info = (
                 f"  - Lead #{lead['id']}: Customer = {lead['customer_name']}, "
                 f"Property = {lead['property_name']}, Status = {lead['status']}"
             )
-            if lead.get('notes'): lead_info += f", Notes = {lead['notes']}"
-            if lead.get('followup'): lead_info += f", Follow-up = {lead['followup']}"
-            context_parts.append(lead_info)
+            if lead.get("notes"):
+                info += f", Notes = {lead['notes']}"
+            context_parts.append(info)
 
-    # 3. Projects
     projects = data.get("projects", [])
     if projects:
-        context_parts.append(f"\nRelated Project/Property Details:")
+        context_parts.append("\nRelated Project/Property Details:")
         for proj in projects:
-            proj_info = f"  - {proj['name']}"
-            if proj.get('type'): proj_info += f" (Type: {proj['type']})"
-            if proj.get('alias'): proj_info += f" | Alias: {proj['alias']}"
-            if proj.get('commission_percentage'): proj_info += f" | Commission: {proj['commission_percentage']}%"
-            context_parts.append(proj_info)
+            info = f"  - {proj['name']}"
+            if proj.get("type"):
+                info += f" (Type: {proj['type']})"
+            if proj.get("commission_percentage"):
+                info += f" | Commission: {proj['commission_percentage']}%"
+            context_parts.append(info)
 
-    # 4. Meetings
     meetings = data.get("meetings", [])
     if meetings:
-        context_parts.append(f"\nPast Meetings/Appointments:")
+        context_parts.append("\nPast Meetings/Appointments:")
         for mtg in meetings:
-            mtg_info = f"  - {mtg['meeting_type']}: {mtg.get('meeting_date', 'TBD')} | Status: {mtg['status']}"
-            context_parts.append(mtg_info)
+            context_parts.append(
+                f"  - {mtg['meeting_type']}: {mtg.get('meeting_date', 'TBD')} | Status: {mtg['status']}"
+            )
 
     if not context_parts:
         context_parts.append(f"No previous information found for this number ({phone_number}).")
@@ -108,219 +119,327 @@ def build_context_from_db(phone_number: str, pre_fetched_data: dict = None) -> s
     return "\n".join(context_parts)
 
 
-
 # ============================================================
 # Agent Instructions
 # ============================================================
 
+# BASE_INSTRUCTIONS — persona, language rules, situation handling.
+# No project-specific facts here. {caller_name} and {price_accuracy_block}
+# are substituted at build time.
 BASE_INSTRUCTIONS = """\
 You are 'रिया' from Hookfish. A confident and professional Indian woman who works as a real estate calling executive.
 
-VOICE & PERSONA (THIS IS THE MOST IMPORTANT SECTION):
+VOICE & PERSONA:
 - You are NOT a bot. You are a real person having a professional, respectful conversation.
-- Imagine you are a composed, knowledgeable woman in her late 20s who is good at business communication.
-- Your tone is polite and professional — like a well-trained corporate executive, not a friend calling casually.
-- Be courteous but get to the point. Don't be overly enthusiastic or excessively friendly.
-- Use measured, professional reactions:
-  "जी बिल्कुल.", "अच्छा.", "जी सही बात है.", "right.",
-  "जी मैं समझती हूँ.", "sure."
-- Maintain a steady, calm pace. No rushing, no over-excitement.
-- If they sound busy → be respectful: "Sorry to disturb. बस दो minute लूँगी आपका."
-- If they ask questions → answer directly and clearly: "जी, मैं बताती हूँ..."
-- If they sound confused → clarify calmly: "जी मैं समझाती हूँ. देखिए..."
-- Keep responses SHORT and precise (1-2 lines). Be informative, not chatty.
+- Your tone is polite and professional. Be courteous but get to the point.
+- Use measured reactions: "जी बिल्कुल.", "अच्छा.", "जी सही बात है.", "जी मैं समझती हूँ."
+- Keep responses SHORT (1-2 lines). Be informative, not chatty.
 - Use natural feminine Hindi grammar ALWAYS:
-  ✅ "मैं बोल रही हूँ", "मैं भेज दूँगी", "मैं करा दूँगी", "मैंने सोचा"
-  ❌ NEVER: "मैं बोलता हूँ", "मैं भेज दूँगा" (masculine — ABSOLUTELY FORBIDDEN)
+  CORRECT: "मैं बोल रही हूँ", "मैं भेज दूँगी"
+  WRONG: "मैं बोलता हूँ" (masculine — FORBIDDEN)
 
-CONVERSATION STYLE:
-- Acknowledge what the person said briefly, then move to the point.
-- Use professional transition phrases like: "तो बात ये है कि...", "एक important बात बताती हूँ...", "और एक बात..."
-- Share information in a structured way. Don't over-hype. Let facts speak.
-- Ask relevant follow-up questions to qualify the lead.
+  PERSONALITY & HUMAN EXPRESSIONS:
+- Use natural filler words: "हाँ", "अच्छा", "हम्म", "देखिए", "सुनिए", "actually", "basically"
+- React naturally to what caller says:
+  Positive news → "अरे वाह! बहुत अच्छा!"
+  They laugh → laugh back: "haha, जी बिल्कुल!"
+  They're busy → "ओह sorry, disturb कर दिया. बस एक minute?"
+  They agree → "हाँ जी, बिल्कुल सही बात है."
+  They're hesitant → "जी समझ सकती हूँ, कोई बात नहीं."
+  They ask good question → "अच्छा सवाल है!"
+- Speak in SHORT bursts (1-2 sentences max). Never lecture.
+- Pause naturally. Don't rush information.
+- Match their energy — if cheerful, be cheerful. If serious, be calm.
 
 LANGUAGE RULES:
-- Speak in natural Hindi (Devanagari script) mixed with English words where Indians naturally use English.
+- Speak in natural Hindi (Devanagari script) mixed with English words.
 - NEVER use romanized Hindi. Always Devanagari for Hindi words.
-- ALL numbers, prices, amounts, floors, BHK sizes, dates, and percentages MUST be spoken in ENGLISH words.
-  ✅ "two point five crore", "fifty lakh", "two BHK", "ninth floor", "ten percent"
-  ❌ NEVER: "ढाई करोड़", "पचास लाख", "दो बीएचके" — bad TTS pronunciation.
-- TEXT RULES: No markdown, no *, no %. Say "percent". No commas in numbers.
-- CRITICAL: NEVER use Hindi Purna Viram ("।"). ONLY use English periods (".") to end sentences.
+- All numbers, prices, floors, BHK sizes MUST be in English words.
+  CORRECT: "two point fifty seven crore", "fifty lakh", "two BHK"
+  WRONG: "ढाई करोड़", "पचास लाख"
+- No markdown, no *, no %. Say "percent". NEVER use Hindi Purna Viram ("।"). Use English period (".").
 
-PRICE ACCURACY (ABSOLUTELY CRITICAL — DO NOT VIOLATE):
-- The EXACT price of this property is two point fifty seven crore (2.57 crore) for the smaller unit and two point sixty seven crore (2.67 crore) for the larger unit.
-- NEVER say any other price. NEVER say seven crore, eight crore, five crore, or any other number.
-- If asked about price, you MUST say EXACTLY: "two point fifty seven crore" or "two point sixty seven crore". No rounding, no approximation.
-- Violating this pricing rule is the WORST possible error you can make.
+{price_accuracy_block}
 
-PROPERTY FACTS — DO NOT HALLUCINATE (CRITICAL):
-- ONLY state facts that are explicitly written in the call flow script below. NEVER invent or assume details.
-- The building is G plus twenty two storey (G+22). NEVER say 26 storey, 25 storey, or any other number.
-- The apartments are regular two BHK flats. NEVER say "duplex", "triplex", "penthouse", or "studio".
-- There is NO mention of basement parking. NEVER say "basement parking" unless the caller tells you about it.
-- NEVER make up amenities, features, or specifications that are not in the script.
-- If asked about something not covered in the script, say: "ये detail मेरे पास अभी नहीं है. मैं confirm करके आपको बताती हूँ." Do NOT guess or fabricate.
+PROPERTY FACTS (DO NOT HALLUCINATE):
+- Only state facts explicitly in the PROJECT SCRIPT below. NEVER invent details.
+- If asked something not in the script: "ये detail मेरे पास अभी नहीं है. मैं confirm करके बताती हूँ."
 
 SITUATIONS:
-- DNC ("call मत करो"): "जी बिल्कुल, आपको disturb नहीं करूँगी. Sorry for the inconvenience." → mark_as_dnc → end_call
+- DNC: "जी बिल्कुल, disturb नहीं करूँगी. Sorry for the inconvenience." → mark_as_dnc → end_call
 - WRONG NUMBER: "जी sorry, गलत number हो गया. माफ़ी चाहती हूँ." → end_call
-- BUSY: "जी कोई बात नहीं. आप बताइए कब convenient रहेगा, मैं तब call करती हूँ." → schedule_callback
-- ABUSIVE: Stay calm, "जी मैं समझती हूँ." → end_call if continues
+- BUSY: "जी कोई बात नहीं. कब convenient रहेगा?" → schedule_callback
 - SILENCE: "{caller_name} जी? Hello? सुन पा रहे हैं आप?"
 
-CALL ENDING:
-- "चलिए {caller_name} जी, आपका बहुत बहुत धन्यवाद. अगर कोई भी सवाल हो तो बेझिझक call करिए. Good day!"
-
-NAME USAGE (CRITICAL):
-- You MUST address the caller by their name ({caller_name}) throughout the conversation.
-- Use "{caller_name} जी" naturally in greetings, questions, and closing.
-- If {caller_name} is "Customer" or "Sir/Ma'am", ask their name politely at the start: "जी आपका शुभ नाम?"
-
-TOOL RULES (CRITICAL):
-- Tools run in background. Caller must NEVER know tools exist.
-- When tool returns "[SILENT] Done." → say NOTHING about it. Continue naturally.
-- NEVER say: "outcome", "captured", "saved", "scheduled", "noted", "recorded", "marked", "logged".
+NAME USAGE: Address caller as "{caller_name} जी" throughout.
+TOOL RULES: Tools run silently. When tool returns "[SILENT] Done." say NOTHING about it.
 """
 
-BUYER_INSTRUCTIONS = """
---- BUYER CALL FLOW (STRICT SCRIPT) ---
-Follow this exact sequence and wording to sound highly natural and human:
+# BUYER_SCRIPT_TEMPLATE — used when no DB script exists for the project.
+# {project_*} placeholders are substituted from DB facts or kept as
+# generic prompts so the agent still functions without a DB record.
+BUYER_SCRIPT_TEMPLATE = """
+--- BUYER CALL FLOW ---
 
-1. INITIAL GREETING:
-   Say EXACTLY: "नमस्ते {caller_name} जी, कैसे हैं आप?"
-   -> wait for user response.
+1. GREETING: "नमस्ते {caller_name} जी, कैसे हैं आप?" → wait
 
-2. INTRODUCTION (After they respond):
-   Say: "जी मैं र‍िया बोल रही हूँ Hookfish से. मैं आपको एक property opportunity के बारे में जानकारी देने के लिए call किया था. क्या आपके पास एक minute है?"
-   -> wait for user response.
+2. INTRO: "जी मैं रिया बोल रही हूँ Hookfish से. एक property opportunity के बारे में बताने के लिए call किया था. क्या एक minute है?" → wait
 
-3. FIRST PITCH (If they say yes/tell me):
-   Say: "जी {caller_name} जी, हम माहिम West में एक नया project लेकर आए हैं - 'माणिक्य' by Viyan Ventures. ये South Bombay का prime location है. Railway station और Shitla Devi Metro Station दोनों walking distance पर हैं. यहाँ two BHK apartments हैं और सबसे important बात इसका payment plan है—अभी सिर्फ fifty lakh देना है और possession तक कोई payment नहीं. इससे buyer का risk काफी कम हो जाता है. क्या आप इसके बारे में और जानना चाहेंगे?"
-   -> wait for user response.
+3. PITCH: "जी {caller_name} जी, {project_pitch_line} क्या और जानना चाहेंगे?" → wait
 
-4. SECOND PITCH / DETAILS (If they ask to know more):
-   Say: "जी {caller_name} जी, मैं आपको details बता देती हूँ. ये एक redevelopment project है और construction Miven Technology से हो रहा है. Currently eleventh slab complete हो चुका है out of twenty three. BMC से CC eighteenth floor तक मिल चुका है. New buyers के लिए thirteenth floor और उससे ऊपर के apartments available हैं. RERA possession twenty twenty nine है. अगर आप interested हैं तो एक बार site visit कर सकते हैं ताकि आप construction quality खुद देख सकें. कब convenient रहेगा?"
+4. DETAILS: "{project_detail_lines} Site visit कब convenient रहेगा?"
 
-5. HANDLING COMMON QUESTIONS (Use exactly these answers):
-   - Total floors? -> "G plus twenty two storey structure है. Already eleventh slab complete हो चुका है out of twenty three. Slab approximately one year में complete हो जाएगा."
-   - Area/Size? -> "Two BHK के लिए six hundred four और six hundred nineteen square feet RERA carpet area के options available हैं. आपको कौन सा size suit करेगा?"
-   - Price? -> [CRITICAL: Say EXACTLY this price. Do NOT change the numbers.] "अच्छा तो price बताती हूँ. छोटे two BHK की price है two point fifty seven crore all inclusive. और बड़े वाले की two point sixty seven crore all inclusive. All inclusive means agreement value plus stamp duty six percent plus GST five percent plus other charges सब included है. तो basically under three crore में South Bombay में two BHK मिल रहा है."
-   - Payment plan? -> "अभी सिर्फ fifty lakh देना है own funds या bank financing से. उसके बाद possession तक कोई payment नहीं. आप stamp duty और GST pay करके property register भी करा सकते हैं जिससे risk और कम हो जाता है. क्या आप site visit करना चाहेंगे?"
-   - Exact Location? -> "माहिम West में है, Jimmy Boy Bakery के opposite, Bank Of Baroda landmark, Desai Park. Railway station और Shitla Devi Metro Station walking distance पर हैं. Location बहुत बड़ा advantage है. मैं आपको location details share कर दूँगी."
-   - Who is the developer? -> "Viyan Ventures ने develop किया है. Mr. Nayan Gandhi और Mr. Rohan Jain दोनो directors हैं. Western Mumbai production.. Goregaon Malad में काफ़ी experience है. ये उनका South Bombay का first project है माहिम West में."
-   - Which floors available? -> "Thirteenth floor और ऊपर के apartments available हैं new buyers के लिए. Below thirteenth floor old society members को दिए गए हैं. ये एक redevelopment project है."
-   - Construction quality? -> "Miven Technology से बन रहा है जो fast floor slab casting के लिए use होती है. Already eleventh slab complete है. BMC से CC eighteenth floor तक मिल चुका है. Nineteen to twenty two floor का CC process में है."
+5. KEY ANSWERS:
+{project_key_answers}
 
-6. CLOSING & SCHEDULING:
-   - INTERESTED -> ask date/time -> schedule_meeting
-   - MAYBE -> offer project details -> schedule_callback
-   - NOT INTERESTED -> ask concern -> address briefly -> end_call
+6. CLOSE:
+   - Interested → schedule_meeting
+   - Maybe → schedule_callback
+   - Not interested → address concern briefly → capture_outcome → end_call
 --- END BUYER FLOW ---
 """
 
-BROKER_INSTRUCTIONS = """
---- BROKER CALL FLOW (STRICT SCRIPT) ---
-You are speaking with a BROKER (real estate channel partner).
-Follow this exact sequence and wording to sound highly natural and expressive:
+BROKER_SCRIPT_TEMPLATE = """
+--- BROKER CALL FLOW ---
 
-1. INITIAL GREETING:
-   Say EXACTLY: "नमस्ते {caller_name} जी, कैसे हैं आप?"
-   -> wait for user response.
+1. GREETING: "नमस्ते {caller_name} जी, कैसे हैं आप?" → wait
 
-2. INTRODUCTION:
-   Say: "जी मैं र‍िया बोल रही हूँ Hookfish से. मैं आपको एक property opportunity के बारे में जानकारी देने के लिए call किया था. ये आपके clients के लिए काफी useful हो सकती है. क्या आपके पास एक minute है?"
-   -> wait for user response.
+2. INTRO: "जी मैं रिया बोल रही हूँ Hookfish से. एक property opportunity है जो आपके clients के लिए useful हो सकती है. एक minute है?" → wait
 
-3. FIRST PITCH:
-   - If NO TARGET PROJECT is provided, pitch 'Maanikya': 
-     "जी {caller_name} जी, हम माहिम West में एक नया project लेकर आए हैं - 'माणिक्य' by Viyan Ventures. ये South Bombay का prime location है. Railway station और Shitla Devi Metro Station दोनों walking distance पर हैं. यहाँ two BHK apartments हैं और इसका payment plan काफी attractive है—अभी सिर्फ fifty lakh देना है और possession तक कोई payment नहीं. क्या आप इसके बारे में और जानना चाहेंगे?"
-   - If TARGET PROJECT is provided in DB Context below, pitch it naturally in a similar professional tone, highlighting location and payment plan.
-   -> wait for user response.
+3. PITCH: "जी {caller_name} जी, {project_broker_pitch} क्या और जानना चाहेंगे?" → wait
 
-4. SECOND PITCH / DETAILS (If they ask to know more):
-   Say: "जी {caller_name} जी, मैं आपको details बता देती हूँ. ये एक redevelopment project है और construction Miven Technology से हो रहा है. Currently eleventh slab complete हो चुका है out of twenty three. BMC से CC eighteenth floor तक मिल चुका है. New buyers के लिए thirteenth floor और ऊपर के options हैं. Brokerage details भी काफी attractive हैं. अगर आप interested हैं तो एक बार site visit कर सकते हैं. Senior manager से मिलकर आप technical details discuss कर सकते हैं. कब convenient रहेगा?"
+4. DETAILS: "{project_detail_lines} Site visit कब आ सकते हैं?"
 
-5. HANDLING COMMON QUESTIONS (Use exactly these answers):
-   - Total floors? -> "G plus twenty two storey structure है. Already eleventh slab complete हो चुका है out of twenty three. Slab approximately one year में complete हो जाएगा."
-   - Area/Size? -> "Two BHK के लिए six hundred four और six hundred nineteen square feet RERA carpet area के options available हैं."
-   - Price? -> [CRITICAL: Say EXACTLY this price. Do NOT change the numbers.] "अच्छा तो price बताती हूँ. छोटे two BHK की price है two point fifty seven crore all inclusive. और बड़े वाले की two point sixty seven crore all inclusive. All inclusive means agreement value plus stamp duty six percent plus GST five percent plus other charges. Under three crore में South Bombay का two BHK—clients के लिए बहुत अच्छा deal है."
-   - Payment plan? -> "अभी सिर्फ fifty lakh देना है. उसके बाद possession तक कोई payment नहीं. Buyer stamp duty और GST pay करके property register भी करा सकता है जिससे risk और कम हो जाता है."
-   - Exact Location? -> "माहिम West में है, Jimmy Boy Bakery के opposite, Bank Of Baroda landmark, Desai Park. Railway station और Shitla Devi Metro Station walking distance पर हैं."
-   - Who is the developer? -> "Viyan Ventures. Mr. Nayan Gandhi और Mr. Rohan Jain दोनो directors हैं. Western Mumbai Goregaon Malad में काफ़ी experience है. ये उनका South Bombay का first project है."
-   - Which floors available? -> "Thirteenth floor और ऊपर available हैं new buyers के लिए. Below thirteenth floor old society members को दिए गए हैं. Redevelopment project है."
-   - Construction quality? -> "Miven Technology से बन रहा है. Already eleventh slab complete है. BMC CC eighteenth floor तक मिल चुका है. Nineteen to twenty two floor का CC process में है."
+5. Same key answers as buyer flow above.
 
-6. BROKER QUALIFICATION & SCHEDULING:
-   Ask: "आप currently किस area में काम कर रहे हैं?"
-   - INTERESTED -> ask date/time -> schedule_meeting
-   - MAYBE -> "कोई बात नहीं. मैं आपको complete project details share कर दूँगी. कब call back करूँ?" -> schedule_callback
-   - NOT_INTERESTED -> "समझ गई. अगर बुरा ना मानें, specifically किस वजह से?" -> wait for answer -> end_call
+6. QUALIFY: "आप currently किस area में काम कर रहे हैं?"
+   - Interested → schedule_meeting
+   - Maybe → "Details share कर दूँगी. Callback कब करूँ?" → schedule_callback
+   - Not interested → "किस वजह से?" → capture_outcome → end_call
 --- END BROKER FLOW ---
 """
 
 INBOUND_INSTRUCTIONS = """
-
---- INBOUND CALL INSTRUCTIONS ---
-This is an INBOUND CALL -- meaning the person called you.
-Start the call like this:
-1. "Hello, Hookfish में आपका स्वागत है। मैं रिया बोल रही हूं। मैं आपकी कैसे मदद कर सकती हूं?"
-2. Listen to their response and proceed accordingly
-3. If they ask about a property, give details
-4. If it's a complaint, listen, note it, and say "हमारी team 1 दिन के अंदर call back करेगी"
---- END INBOUND INSTRUCTIONS ---
+--- INBOUND CALL ---
+1. "Hello, Hookfish में आपका स्वागत है. मैं रिया बोल रही हूँ. कैसे मदद करूँ?"
+2. Listen and respond accordingly.
+3. Complaint → "हमारी team एक दिन में call back करेगी."
+--- END INBOUND ---
 """
 
+# Fallback facts used when properties.details has no entry for a field.
+# Keeps the agent functional even if the DB has no record for the project.
+_FALLBACK_FACTS = {
+    "project_name":          "माणिक्य",
+    "developer":             "Viyan Ventures",
+    "location":              "माहिम West",
+    "bhk_type":              "Two BHK",
+    "total_floors":          "G plus twenty two storey",
+    "price_smaller":         "two point fifty seven crore",
+    "price_larger":          "two point sixty seven crore",
+    "payment_plan":          "fifty lakh अभी, possession तक कोई payment नहीं",
+    "unit_sizes":            "six hundred four और six hundred nineteen square feet RERA carpet area",
+    "construction_progress": "Eleventh slab complete out of twenty three. BMC CC eighteenth floor तक.",
+    "available_floors":      "Thirteenth floor और ऊपर",
+    "rera_possession":       "twenty twenty nine",
+    "construction_company":  "Miven Technology",
+    "landmark":              "Jimmy Boy Bakery के opposite, Bank Of Baroda, Desai Park",
+    "commission":            None,   # filled from properties.commission_percentage
+    "site_visit_bonus":      None,   # filled from properties.site_visit_bonus
+}
 
-def build_agent_instructions(is_outbound: bool = False, phone_number: str = None,
-                             contact_type: str = CONTACT_TYPE_BUYER,
-                             caller_name_override: str = None,
-                             target_project: str = None,
-                             pre_fetched_data: dict = None) -> str:
-    """Synchronously builds the instructions string using pre-fetched data."""
+
+def _resolve_facts(target_project: str | None, db_projects: list) -> dict:
+    """
+    Build a complete facts dict for the target project.
+
+    Priority order:
+      1. properties.details JSON  (get_project_facts)
+      2. properties scalar columns (commission_percentage, site_visit_bonus)
+      3. _FALLBACK_FACTS hardcoded defaults
+    """
+    facts = dict(_FALLBACK_FACTS)
+
+    # Try to get structured facts from the DB
+    project_name = target_project or (db_projects[0]["name"] if db_projects else None)
+    if project_name:
+        db_facts = get_project_facts(project_name)
+        if db_facts:
+            # Scalar columns
+            if db_facts.get("commission_percentage"):
+                facts["commission"] = str(db_facts["commission_percentage"])
+            if db_facts.get("site_visit_bonus"):
+                facts["site_visit_bonus"] = str(db_facts["site_visit_bonus"])
+            if db_facts.get("name"):
+                facts["project_name"] = db_facts["name"]
+
+            # JSON details column — individual fields override fallback
+            details = db_facts.get("details") or {}
+            for key in _FALLBACK_FACTS:
+                if key in details and details[key]:
+                    facts[key] = details[key]
+
+    return facts
+
+
+def _build_price_accuracy_block(facts: dict) -> str:
+    """
+    Build the PRICE ACCURACY block from resolved facts.
+    This replaces the hardcoded prices in BASE_INSTRUCTIONS.
+    """
+    smaller = facts.get("price_smaller", "two point fifty seven crore")
+    larger  = facts.get("price_larger",  "two point sixty seven crore")
+    return (
+        f"PRICE ACCURACY (CRITICAL — DO NOT VIOLATE):\n"
+        f"- Exact price: {smaller} (smaller unit) and {larger} (larger unit).\n"
+        f"- NEVER say any other price. NEVER approximate."
+    )
+
+
+def _build_key_answers(facts: dict) -> str:
+    """Build the KEY ANSWERS block from resolved facts."""
+    lines = [
+        f"   - Floors: \"{facts['total_floors']}. {facts['construction_progress']}\"",
+        f"   - Size: \"{facts['unit_sizes']}\"",
+        f"   - Price: \"{facts['price_smaller']} smaller unit, {facts['price_larger']} larger unit. "
+        f"All inclusive — agreement, stamp duty six percent, GST five percent, all charges included.\"",
+        f"   - Payment: \"{facts['payment_plan']}. Stamp duty और GST pay करके register भी करा सकते हैं.\"",
+        f"   - Location: \"{facts['location']}, {facts['landmark']}.\"",
+        f"   - Available floors: \"{facts['available_floors']} new buyers के लिए.\"",
+        f"   - Possession: \"RERA possession {facts['rera_possession']}.\"",
+    ]
+    if facts.get("commission"):
+        lines.append(f"   - Commission: \"{facts['commission']} percent brokerage available.\"")
+    if facts.get("site_visit_bonus"):
+        lines.append(f"   - Site visit bonus: \"Site visit bonus of {facts['site_visit_bonus']}.\"")
+    return "\n".join(lines)
+
+
+def _build_pitch_lines(facts: dict, contact_type: str) -> dict:
+    """Build the pitch, detail, and broker-pitch strings from facts."""
+    f = facts
+    pitch = (
+        f"हम {f['location']} में एक नया project लाए हैं - '{f['project_name']}' by {f['developer']}. "
+        f"South Bombay का prime location है. Station और Metro दोनों walking distance पर हैं. "
+        f"{f['bhk_type']} apartments हैं. Payment plan बहुत attractive है — "
+        f"अभी सिर्फ {f['payment_plan']}."
+    )
+    broker_pitch = (
+        f"{f['location']} में '{f['project_name']}' by {f['developer']}. "
+        f"South Bombay prime location. {f['bhk_type']}. {f['payment_plan']}. "
+        f"Brokerage भी attractive है."
+    )
+    detail = (
+        f"जी, ये redevelopment project है. {f['construction_company']} से construction हो रही है. "
+        f"{f['construction_progress']} New buyers के लिए {f['available_floors']} available है. "
+        f"RERA possession {f['rera_possession']} है."
+    )
+    return {"pitch": pitch, "broker_pitch": broker_pitch, "detail": detail}
+
+
+def build_agent_instructions(
+    is_outbound: bool = False,
+    phone_number: str = None,
+    contact_type: str = CONTACT_TYPE_BUYER,
+    caller_name_override: str = None,
+    target_project: str = None,
+    pre_fetched_data: dict = None,
+) -> str:
+    """
+    Build the complete system prompt for the voice agent.
+
+    Resolution order for project facts:
+      1. properties.details JSON column  (most specific, DB-managed)
+      2. properties scalar columns       (commission, bonuses)
+      3. _FALLBACK_FACTS                 (hardcoded defaults, last resort)
+
+    Resolution order for call script:
+      1. agent_scripts.content matching target_project (DB-managed script)
+      2. Rendered BUYER_SCRIPT_TEMPLATE / BROKER_SCRIPT_TEMPLATE with facts
+    """
+    # ── 1. Caller name ────────────────────────────────────────────
     caller_name = "Sir/Ma'am"
-    db_context = ""
+    data = pre_fetched_data or {}
 
     if phone_number:
-        # 1. Context from DB
-        db_context = build_context_from_db(phone_number, pre_fetched_data=pre_fetched_data)
-        
-        # 2. Resolve Name (use pre-fetched if available)
-        if pre_fetched_data:
-            customer = pre_fetched_data.get("customer")
-            if customer and customer.get("name"):
-                caller_name = customer["name"].strip()
-            else:
-                leads = pre_fetched_data.get("leads", [])
-                if leads and leads[0].get("partner_name"):
-                    caller_name = leads[0]["partner_name"].strip()
+        customer = data.get("customer")
+        if customer and customer.get("name"):
+            caller_name = customer["name"].strip()
         else:
-            # Slow fallback
-            customer = lookup_customer_by_phone(phone_number)
-            if customer and customer.get("name"):
-                caller_name = customer["name"].strip()
+            leads = data.get("leads", [])
+            if leads and leads[0].get("partner_name"):
+                caller_name = leads[0]["partner_name"].strip()
 
-    # Override name
     if caller_name_override:
         caller_name = caller_name_override
 
-    # Build instructions
-    instructions = BASE_INSTRUCTIONS.replace("{caller_name}", caller_name)
+    # ── 2. Resolve project facts ──────────────────────────────────
+    db_projects = data.get("projects", [])
+    facts = _resolve_facts(target_project, db_projects)
 
+    # ── 3. Build base instructions (persona + dynamic price block) ─
+    price_block = _build_price_accuracy_block(facts)
+    instructions = (
+        BASE_INSTRUCTIONS
+        .replace("{caller_name}", caller_name)
+        .replace("{price_accuracy_block}", price_block)
+    )
+
+    # ── 4. Build call script ──────────────────────────────────────
     if not is_outbound:
         instructions += INBOUND_INSTRUCTIONS.replace("{caller_name}", caller_name)
-    elif contact_type == CONTACT_TYPE_BROKER:
-        instructions += BROKER_INSTRUCTIONS.replace("{caller_name}", caller_name)
-    else:
-        instructions += BUYER_INSTRUCTIONS.replace("{caller_name}", caller_name)
 
-    # Add DB context
+    else:
+        # Try to fetch a full script from agent_scripts table first
+        db_script = get_project_script(
+            target_project or facts["project_name"],
+            contact_type,
+        )
+
+        if db_script:
+            # DB script: substitute caller name and any {{fact}} tokens
+            script_section = db_script.replace("{caller_name}", caller_name)
+            for key, value in facts.items():
+                if value:
+                    script_section = script_section.replace(f"{{{{{key}}}}}", value)
+            instructions += f"\n--- PROJECT SCRIPT ---\n{script_section}\n--- END SCRIPT ---\n"
+
+        else:
+            # No DB script: render the appropriate template with resolved facts
+            pitch_lines = _build_pitch_lines(facts, contact_type)
+            key_answers = _build_key_answers(facts)
+
+            if contact_type == CONTACT_TYPE_BROKER:
+                script_section = (
+                    BROKER_SCRIPT_TEMPLATE
+                    .replace("{caller_name}", caller_name)
+                    .replace("{project_broker_pitch}", pitch_lines["broker_pitch"])
+                    .replace("{project_detail_lines}", pitch_lines["detail"])
+                    .replace("{project_key_answers}", key_answers)
+                )
+            else:
+                script_section = (
+                    BUYER_SCRIPT_TEMPLATE
+                    .replace("{caller_name}", caller_name)
+                    .replace("{project_pitch_line}", pitch_lines["pitch"])
+                    .replace("{project_detail_lines}", pitch_lines["detail"])
+                    .replace("{project_key_answers}", key_answers)
+                )
+            instructions += script_section
+
+    # ── 5. DB context (lead history, past meetings) ───────────────
+    db_context = build_context_from_db(phone_number, pre_fetched_data=pre_fetched_data) if phone_number else ""
+
     if target_project:
-        db_context += f"\n\n*** TARGET PROJECT ***\nProject Name: {target_project}\nSTRICT RULE: YOU MUST ONLY PITCH THIS TARGET PROJECT.\n"
+        db_context += (
+            f"\n\n*** TARGET PROJECT ***\n"
+            f"Project: {target_project}\n"
+            f"STRICT RULE: ONLY PITCH THIS PROJECT. Do not discuss any other project.\n"
+        )
 
     if db_context.strip():
         instructions += f"\n\n--- DATABASE CONTEXT ---\n{db_context.strip()}\n---\n"
-    
+
     return instructions
 
 
@@ -329,60 +448,78 @@ def build_agent_instructions(is_outbound: bool = False, phone_number: str = None
 # ============================================================
 
 class FilteredTTS(smallestai.TTS):
-    """Wrapper to intercept and remove Cerebras LLaMA 3.1 function call leaks before TTS speaks it."""
-    def synthesize(self, text: str, **kwargs):
-        original_text = text
-        
-        # Strip everything starting from these backend keywords (case insensitive)
-        pattern = r'(?i)(function name|capture outcome|parameters outcome|interest level|next action|end call parameters|reason call completed|schedule callback arguments).*'
-        text = re.sub(pattern, '', text, flags=re.DOTALL).strip()
-        
-        if original_text != text:
-            logger.warning(f"Intercepted LLM function call leak in TTS text. Original: '{original_text}' -> Filtered: '{text}'")
+    """
+    Strips LLM function-call artifacts before they reach the TTS engine.
+    Handles both Cerebras and Groq tool-call leak formats.
+    """
 
-        if not text.strip():
-            text = " "  # Avoid empty string error in TTS provider
-            
-        return super().synthesize(text, **kwargs)
+    _LABEL_PATTERN = re.compile(
+    r'(?i)('
+    # function only when followed by tool-call context
+    r'\bfunction[\s_]?(?:call|name|calls)\b[\s\S]*'
+    r'|\btool[\s_]?(?:use|call|name)\b[\s\S]*'
+    # specific tool names
+    r'|\bcapture[\s_]?outcome\b[\s\S]*'
+    r'|\bschedule[\s_]?(?:callback|meeting)\b[\s\S]*'
+    r'|\bmark[\s_]?(?:as[\s_]?)?dnc\b[\s\S]*'
+    # parameter labels
+    r'|\bparameters?[\s_]?outcome\b[\s\S]*'
+    r'|\boutcome[\s_]?reason\b[\s\S]*'
+    r'|\blead[\s_]?score\b[\s\S]*'
+    r'|\bnext[\s_]?action\b[\s\S]*'
+    r'|\binterest[\s_]?level\b[\s\S]*'
+    # XML tool tags
+    r'|<tool_call>[\s\S]*?</tool_call>'
+    r'|<function_calls>[\s\S]*'
+    r')',
+    re.DOTALL | re.IGNORECASE,
+)
+
+    _JSON_PATTERN = re.compile(r'[\[{][^)\]]*[\]}]', re.DOTALL)
+    _BRACKET_JUNK = re.compile(r'[\(\[（【][^a-zA-Z\u0900-\u097F]{0,5}[\)\]）】]')
+
+    def synthesize(self, text: str, **kwargs):
+        cleaned = self._LABEL_PATTERN.sub('', text).strip()
+        cleaned = self._JSON_PATTERN.sub('', cleaned).strip()
+        cleaned = self._BRACKET_JUNK.sub('', cleaned).strip()
+        cleaned = re.sub(r'\s{2,}', ' ', cleaned).strip()
+        if not cleaned:
+            cleaned = " "
+        return super().synthesize(cleaned, **kwargs)
+
 
 class VoiceAgent(Agent):
-    def __init__(self, instructions: str, is_outbound: bool = False, phone_number: str = None,
-                 contact_type: str = CONTACT_TYPE_BUYER) -> None:
-
-        logger.info(f"Agent initialized. Contact type: {contact_type}, Outbound: {is_outbound}")
+    def __init__(self, instructions: str, is_outbound: bool = False,
+                 phone_number: str = None, contact_type: str = CONTACT_TYPE_BUYER) -> None:
 
         super().__init__(
             instructions=instructions,
             vad=silero.VAD.load(
-                min_silence_duration=0.4,   # Wait 400ms of silence before cutting
-                min_speech_duration=0.15,   # Need 150ms of speech to register as talking
+                min_silence_duration=0.2,
+                min_speech_duration=0.1,
             ),
             stt=deepgram.STT(
-                model="nova-2",
+                model="nova-3",
                 language="hi",
                 interim_results=True,
                 smart_format=False,
             ),
-            # ULTRA-FAST SWITCH: Using Cerebras for sub-second responses.
-            llm=openai.LLM(
-                model="llama3.1-8b",
-                api_key=os.environ.get("CEREBRAS_API_KEY"),
-                base_url="https://api.cerebras.ai/v1"
+            llm=groq.LLM(
+                model="llama-3.3-70b-versatile",
             ),
-            tts=smallestai.TTS(
+            tts=FilteredTTS(
                 model="lightning-v3.1",
-                voice_id="voice_BTq3OaiWFN",
-                language="hi",
+                voice_id="maithili",
+                language="hi", 
                 sample_rate=16000,
-                base_url="https://api.smallest.ai/waves/v1",
+                #base_url="https://api.smallest.ai/waves/v1",
             ),
-            min_endpointing_delay=0.25,    # Quick 250ms pause detection — fast but not choppy
+            min_endpointing_delay=0.25,
             allow_interruptions=True,
         )
         self._is_outbound = is_outbound
         self._phone_number = phone_number
         self._contact_type = contact_type
-        self._call_start_time = time.time()
 
     async def on_enter(self):
         if not self._is_outbound:
@@ -394,28 +531,16 @@ class VoiceAgent(Agent):
 # ============================================================
 
 def extract_phone_from_identity(identity: str) -> str:
-    """Extract phone number from SIP participant identity.
-    Handles formats like: sip:+91xxx@domain, +91xxx, 91xxx, etc.
-    """
     if not identity:
         return None
-
-    # Try sip:+number@domain format
     sip_match = re.search(r'sip:(\+?\d+)@', identity)
     if sip_match:
-        number = sip_match.group(1)
-        if not number.startswith('+'):
-            number = '+' + number
-        return number
-
-    # Try plain phone number (with or without +)
+        n = sip_match.group(1)
+        return n if n.startswith('+') else '+' + n
     phone_match = re.match(r'(\+?\d{10,15})$', identity)
     if phone_match:
-        number = phone_match.group(1)
-        if not number.startswith('+'):
-            number = '+' + number
-        return number
-
+        n = phone_match.group(1)
+        return n if n.startswith('+') else '+' + n
     return None
 
 
@@ -424,508 +549,318 @@ def extract_phone_from_identity(identity: str) -> str:
 # ============================================================
 
 async def entrypoint(ctx: JobContext):
-    logger.info(f"User connected to room: {ctx.room.name}")
+    logger.info(f"Room connected: {ctx.room.name}")
 
-    # ---- Parse metadata ----
     phone_number = None
     is_outbound = False
-    contact_type = CONTACT_TYPE_BUYER  # default
+    contact_type = CONTACT_TYPE_BUYER
     sip_trunk_id = os.getenv("TRUNK_ID", "")
-
     caller_name_override = None
-    call_log_id = None  # Will track this call in agent_call_logs
+    call_log_id = None
     target_project = None
+    caller_name = "Sir/Ma'am"
 
+    # ---- Parse metadata ----
     if ctx.job.metadata:
         try:
             dial_info = json.loads(ctx.job.metadata)
             phone_number = dial_info.get("phone_number")
             contact_type = dial_info.get("contact_type", CONTACT_TYPE_BUYER)
-            caller_name_override = dial_info.get("caller_name")  # optional name override
+            caller_name_override = dial_info.get("caller_name")
             target_project = dial_info.get("target_project")
             if phone_number:
                 is_outbound = True
-                logger.info(f"Outbound call detected. Target: {phone_number}, Type: {contact_type}, Name: {caller_name_override or 'from DB'}")
         except json.JSONDecodeError:
             pass
 
-    # ---- Pre-call Optimized Data Fetch ----
-    db_data = {"allowed": True, "reason": "OK"}
+    # ---- Pre-fetch DB data ----
+    db_data = {"allowed": True, "reason": "OK", "customer": None, "leads": [], "projects": [], "meetings": []}
     if phone_number:
-        logger.info(f"Pre-fetching optimized DB data for {phone_number}...")
+        logger.info(f"Pre-fetching DB data for {phone_number}...")
         db_data = await asyncio.to_thread(get_agent_context_optimized, phone_number)
-        
-    # ---- Pre-call Validation ----
+
+    # ---- Outbound validation ----
     if is_outbound and phone_number:
-        if not db_data["allowed"]:
-            logger.warning(f"Call NOT allowed to {phone_number}: {db_data['reason']}")
+        if not db_data.get("allowed", True):
+            logger.warning(f"Call blocked to {phone_number}: {db_data['reason']}")
             ctx.shutdown(reason=f"call_blocked: {db_data['reason']}")
             return
 
-        # Get name from pre-fetched data
-        caller_name = caller_name_override
-        if not caller_name:
+        if caller_name_override:
+            caller_name = caller_name_override
+        else:
             customer = db_data.get("customer")
-            if customer:
-                caller_name = customer.get("name")
+            if customer and customer.get("name"):
+                caller_name = customer["name"].strip()
             else:
                 leads = db_data.get("leads", [])
-                if leads:
-                    caller_name = leads[0].get("partner_name")
+                if leads and leads[0].get("partner_name"):
+                    caller_name = leads[0]["partner_name"].strip()
 
-        if not caller_name:
-            caller_name = "Sir/Ma'am"
-
-    # ---- Create Call Log ----
+    # ---- Create call log ----
     if phone_number:
         call_log_id = create_call_log(
             call_id=ctx.room.name,
             phone_number=phone_number,
-            caller_name=caller_name_override,
+            caller_name=caller_name_override or caller_name,
             contact_type=contact_type,
             direction="outbound" if is_outbound else "inbound",
             room_name=ctx.room.name,
         )
         record_call_attempt(phone_number, result="initiated", call_log_id=call_log_id)
 
-    # ---- Instructions & Connect ----
-    if is_outbound:
-        await ctx.connect()
-        logger.info("Building agent instructions (outbound)...")
-        agent_instructions = await asyncio.to_thread(
-            build_agent_instructions, True, phone_number, contact_type, caller_name_override, target_project, db_data
-        )
-    else:
-        logger.info("Inbound call detected. Waiting for caller to connect...")
-        await ctx.connect()
+    # ---- Build instructions ----
+    agent_instructions = await asyncio.to_thread(
+        build_agent_instructions,
+        is_outbound, phone_number, contact_type,
+        caller_name_override, target_project, db_data,
+    )
 
-        # Check existing participants
+    # ---- Connect to room ----
+    await ctx.connect()
+
+    # ---- Inbound: wait for SIP participant ----
+    if not is_outbound:
         for participant in ctx.room.remote_participants.values():
-            identity = participant.identity
-            logger.info(f"Found existing participant: {identity} (name: {participant.name})")
-            phone_number = extract_phone_from_identity(identity)
-            if phone_number:
-                logger.info(f"Extracted phone from existing participant: {phone_number}")
+            extracted = extract_phone_from_identity(participant.identity)
+            if extracted:
+                phone_number = extracted
                 break
 
-        # If no participant yet, wait for one
         if not phone_number:
-            logger.info("No participant yet, waiting for caller to join...")
             try:
-                participant_event = asyncio.Event()
-                found_phone = {"number": None}
+                event = asyncio.Event()
+                found = {"number": None}
 
-                def on_participant_connected(participant: rtc.RemoteParticipant):
-                    logger.info(f"Participant connected: {participant.identity} (name: {participant.name})")
-                    extracted = extract_phone_from_identity(participant.identity)
-                    if extracted:
-                        found_phone["number"] = extracted
-                        logger.info(f"Extracted phone from new participant: {extracted}")
-                    participant_event.set()
+                def on_connected(p: rtc.RemoteParticipant):
+                    n = extract_phone_from_identity(p.identity)
+                    if n:
+                        found["number"] = n
+                    event.set()
 
-                ctx.room.on("participant_connected", on_participant_connected)
+                ctx.room.on("participant_connected", on_connected)
+                await asyncio.wait_for(event.wait(), timeout=30.0)
+                phone_number = found["number"]
+            except asyncio.TimeoutError:
+                logger.warning("Timeout waiting for inbound participant.")
 
-                try:
-                    await asyncio.wait_for(participant_event.wait(), timeout=30.0)
-                    phone_number = found_phone["number"]
-                except asyncio.TimeoutError:
-                    logger.warning("Timeout waiting for participant. Proceeding without phone number.")
-            except Exception as e:
-                logger.error(f"Error waiting for participant: {e}")
-
-        # Now fetch data for inbound
-        if phone_number:
-            logger.info(f"Fetching DB data for inbound caller {phone_number}...")
+        if phone_number and not call_log_id:
             db_data = await asyncio.to_thread(get_agent_context_optimized, phone_number)
-            
-            # Create call log for inbound
-            if not call_log_id:
-                call_log_id = create_call_log(
-                    call_id=ctx.room.name,
-                    phone_number=phone_number,
-                    contact_type=contact_type,
-                    direction="inbound",
-                    room_name=ctx.room.name,
-                )
-                record_call_attempt(phone_number, result="initiated", call_log_id=call_log_id)
+            call_log_id = create_call_log(
+                call_id=ctx.room.name,
+                phone_number=phone_number,
+                contact_type=contact_type,
+                direction="inbound",
+                room_name=ctx.room.name,
+            )
 
-        logger.info("Building agent instructions (inbound)...")
-        agent_instructions = await asyncio.to_thread(
-            build_agent_instructions, False, phone_number, contact_type, caller_name_override, target_project, db_data
-        )
-
-    logger.info(f"Starting agent session. Phone: {phone_number or 'unknown'}, Type: {contact_type}, Outbound: {is_outbound}, Target: {target_project}")
-
-
-    # ---- Transcript collector ----
+    # ---- Transcript & timing ----
     transcript_messages = []
-    call_start_time = time.time()  # Track when the call actually starts
-    MIN_CALL_BEFORE_OUTCOME = 30   # Minimum seconds before capture_outcome/end_call are allowed
+    call_start_time = time.time()
+    MIN_CALL_SECS = 20  # block tools for first 30s to prevent premature end
 
-    # ---- Define Function Tools ----
+    # ---- Function Tools ----
 
-    @function_tool(
-        name="end_call",
-        description="Ends the current call. Use this AFTER capture_outcome, or when the user says goodbye."
-    )
-    async def end_call(reason: str | None = "call_completed") -> str:
-        """End the call and disconnect.
-
-        Args:
-            reason: The reason for ending the call, e.g. 'user_requested', 'call_completed', 'max_duration', 'wrong_number', 'dnc_requested'
-        """
-        elapsed = time.time() - call_start_time
-        if elapsed < MIN_CALL_BEFORE_OUTCOME:
-            logger.warning(f"end_call BLOCKED — only {elapsed:.0f}s into call (min {MIN_CALL_BEFORE_OUTCOME}s). Greet the caller first!")
+    @function_tool(name="end_call", description="End the call after capture_outcome. Use when user says goodbye.")
+    async def end_call(reason: str = "call_completed") -> str:
+        if time.time() - call_start_time < MIN_CALL_SECS:
             return ""
-
-        logger.info(f"end_call tool invoked. Reason: {reason}")
-
-        # Save transcript and update call log
+        logger.info(f"end_call: {reason}")
         if call_log_id:
-            duration = int(time.time() - call_start_time)
             try:
-                transcript_text = "\n".join(
-                    [f"{m['role']}: {m['text']}" for m in transcript_messages]
-                )
                 update_call_log(
                     call_log_id,
-                    duration_seconds=duration,
-                    transcript=transcript_text,
-                    notes=f"Call ended. Reason: {reason}",
+                    duration_seconds=int(time.time() - call_start_time),
+                    transcript="\n".join(f"{m['role']}: {m['text']}" for m in transcript_messages),
+                    notes=f"Ended: {reason}",
                 )
             except Exception as e:
-                logger.error(f"Error saving final call data: {e}")
+                logger.error(f"end_call log error: {e}")
 
-        async def _shutdown_after_delay():
-            await asyncio.sleep(3)  # wait for goodbye TTS to finish
+        async def _shutdown():
+            await asyncio.sleep(3)
             try:
                 job_ctx = get_job_context()
                 await job_ctx.delete_room()
                 job_ctx.shutdown(reason="end_call")
             except Exception as e:
-                logger.error(f"Error during shutdown: {e}")
+                logger.error(f"shutdown error: {e}")
 
-        asyncio.create_task(_shutdown_after_delay())
+        asyncio.create_task(_shutdown())
         return "[SILENT] Done. Say goodbye naturally."
 
     @function_tool(
         name="capture_outcome",
-        description=(
-            "ONLY use this when the call is ENDING — NEVER at the start or middle of a call. "
-            "You must have had a full conversation before using this. "
-            "Use this to save the final call outcome and interest level. "
-            "outcome values: 'interested', 'maybe', 'not_interested', 'callback_requested', 'escalated', 'dnc', 'wrong_number'. "
-            "interest_level values: 'high', 'medium', 'low', 'none'."
-        )
+        description="Save call outcome. ONLY use when call is ending — NEVER at start. outcome: 'interested'/'maybe'/'not_interested'/'callback_requested'/'dnc'/'wrong_number'. interest_level: 'high'/'medium'/'low'/'none'.",
     )
     async def capture_outcome(
         outcome: str,
-        reason: str | None = None,
-        interest_level: str | None = "unknown",
-        next_action: str | None = None,
+        reason: str = None,
+        interest_level: str = "unknown",
+        next_action: str = None,
     ) -> str:
-        """Save the call outcome, interest level, and reason to the database.
-
-        Args:
-            outcome: The outcome of the call - 'interested', 'maybe', 'not_interested', 'callback_requested', 'escalated', 'dnc', 'wrong_number'
-            reason: Why they are not interested or want to call back, free text
-            interest_level: How interested they are - 'high', 'medium', 'low', 'none'
-            next_action: What should happen next - 'callback', 'site_visit', 'send_details', 'escalate', 'none'
-        """
-        elapsed = time.time() - call_start_time
-        if elapsed < MIN_CALL_BEFORE_OUTCOME:
-            logger.warning(f"capture_outcome BLOCKED — only {elapsed:.0f}s into call (min {MIN_CALL_BEFORE_OUTCOME}s). Greet the caller first!")
+        if time.time() - call_start_time < MIN_CALL_SECS:
             return ""
-        logger.info(
-            f"capture_outcome invoked. Phone: {phone_number}, "
-            f"Outcome: {outcome}, Reason: {reason}, "
-            f"Interest: {interest_level}, Next: {next_action}"
-        )
-
-        # Save to the existing leads system
+        logger.info(f"capture_outcome: {outcome}, interest={interest_level}")
         if phone_number:
-            save_call_outcome(
-                phone=phone_number,
-                outcome=outcome,
-                reason=reason or None,
-                interest_level=interest_level,
-                next_action=next_action or None,
-            )
-
-        # Also update the agent call log
+            save_call_outcome(phone=phone_number, outcome=outcome, reason=reason,
+                              interest_level=interest_level, next_action=next_action)
         if call_log_id:
-            # Map outcome to disposition
-            disposition_map = {
-                "interested": "qualified",
-                "maybe": "follow_up",
-                "not_interested": "rejected",
-                "callback_requested": "callback",
-                "escalated": "escalated",
-                "dnc": "dnc",
-                "wrong_number": "wrong_number",
-            }
             update_call_log(
                 call_log_id,
-                disposition=disposition_map.get(outcome, outcome),
-                qualification=outcome,
-                interest_level=interest_level,
-                outcome_reason=reason,
-                next_action=next_action,
+                disposition={"interested":"qualified","maybe":"follow_up","not_interested":"rejected",
+                             "callback_requested":"callback","dnc":"dnc","wrong_number":"wrong_number"}.get(outcome, outcome),
+                qualification=outcome, interest_level=interest_level,
+                outcome_reason=reason, next_action=next_action,
             )
-
         return "[SILENT] Done."
 
-    @function_tool(
-        name="schedule_callback",
-        description=(
-            "Use this to schedule a callback or follow-up. "
-            "Use when the user asks to call back later."
-        )
-    )
+    @function_tool(name="schedule_callback", description="Schedule a callback when user asks to be called later.")
     async def schedule_callback(
-        callback_date: str | None = None,
-        callback_time: str | None = None,
-        notes: str | None = None,
+        callback_date: str = None,
+        callback_time: str = None,
+        notes: str = None,
     ) -> str:
-        """Schedule a callback or follow-up for later.
-
-        Args:
-            callback_date: Date for callback, e.g. 'kal', 'monday', '15 march'
-            callback_time: Time for callback, e.g. 'shaam 5 baje', '3 PM'
-            notes: Any additional notes about the callback
-        """
-        elapsed = time.time() - call_start_time
-        if elapsed < MIN_CALL_BEFORE_OUTCOME:
-            logger.warning(f"schedule_callback BLOCKED — only {elapsed:.0f}s into call. Greet first!")
+        if time.time() - call_start_time < MIN_CALL_SECS:
             return ""
-
-        callback_info = f"Date: {callback_date}, Time: {callback_time}"
-        if notes:
-            callback_info += f", Notes: {notes}"
-
-        logger.info(f"schedule_callback invoked. Phone: {phone_number}, {callback_info}")
-
+        logger.info(f"schedule_callback: {callback_date} {callback_time}")
         if phone_number:
-            save_call_outcome(
-                phone=phone_number,
-                outcome="callback_requested",
-                next_action="callback",
-                callback_date=f"{callback_date} {callback_time}".strip(),
-            )
-
-        # Update call log with callback info
+            save_call_outcome(phone=phone_number, outcome="callback_requested",
+                              next_action="callback",
+                              callback_date=f"{callback_date or ''} {callback_time or ''}".strip())
         if call_log_id:
-            update_call_log(
-                call_log_id,
-                next_action="callback",
-                notes=f"Callback scheduled: {callback_info}",
-            )
-
+            update_call_log(call_log_id, next_action="callback",
+                            notes=f"Callback: {callback_date} {callback_time}")
         return "[SILENT] Done."
 
-    @function_tool(
-        name="mark_as_dnc",
-        description=(
-            "Mark this phone number as Do Not Call. "
-            "Use ONLY when the contact explicitly asks to be removed from the call list. "
-            "Examples: 'mujhe call mat karo', 'remove me from your list', 'don't call again'."
-        )
-    )
-    async def mark_as_dnc(reason: str | None = "user_requested") -> str:
-        """Mark the current phone number as Do Not Call.
-
-        Args:
-            reason: Why they want to be removed, e.g. 'user_requested', 'not_interested_permanent'
-        """
-        elapsed = time.time() - call_start_time
-        if elapsed < MIN_CALL_BEFORE_OUTCOME:
-            logger.warning(f"mark_as_dnc BLOCKED — only {elapsed:.0f}s into call. Greet first!")
+    @function_tool(name="mark_as_dnc", description="Mark number as Do Not Call. Use ONLY when caller explicitly asks to be removed.")
+    async def mark_as_dnc(reason: str = "user_requested") -> str:
+        if time.time() - call_start_time < MIN_CALL_SECS:
             return ""
-
-        logger.info(f"mark_as_dnc invoked. Phone: {phone_number}, Reason: {reason}")
-
+        logger.info(f"mark_as_dnc: {phone_number}")
         if phone_number:
             db_mark_dnc(phone_number, reason=reason, added_by="agent")
-
-        # Update call log
         if call_log_id:
-            update_call_log(
-                call_log_id,
-                disposition="dnc",
-                notes=f"DNC marked. Reason: {reason}",
-            )
-
+            update_call_log(call_log_id, disposition="dnc", notes=f"DNC: {reason}")
         return "[SILENT] Done."
 
-    @function_tool(
-        name="schedule_meeting",
-        description=(
-            "Schedule a site visit or meeting. Use when the buyer/broker agrees to a site visit or meeting. "
-            "This will automatically allocate a manager using round-robin. "
-            "Provide the date, time, and meeting type."
-        )
-    )
+    @function_tool(name="schedule_meeting", description="Schedule a site visit or meeting when buyer/broker agrees.")
     async def schedule_meeting(
-        meeting_date: str | None = None,
-        meeting_time: str | None = None,
-        meeting_type: str | None = "site_visit",
-        project_name: str | None = None,
-        location: str | None = None,
-        notes: str | None = None,
+        meeting_date: str = None,
+        meeting_time: str = None,
+        meeting_type: str = "site_visit",
+        project_name: str = None,
+        location: str = None,
+        notes: str = None,
     ) -> str:
-        """Schedule a meeting/site visit and auto-allocate a manager.
-
-        Args:
-            meeting_date: Date for the meeting, e.g. 'kal', 'monday', '15 march', '2026-03-20'
-            meeting_time: Time for the meeting, e.g. 'subah 10 baje', '3 PM', '10:00'
-            meeting_type: Type: 'site_visit', 'office_meeting', 'call_back'
-            project_name: Name of the project/property for the meeting
-            location: Meeting location if known
-            notes: Any additional notes
-        """
-        elapsed = time.time() - call_start_time
-        if elapsed < MIN_CALL_BEFORE_OUTCOME:
-            logger.warning(f"schedule_meeting BLOCKED — only {elapsed:.0f}s into call. Greet first!")
+        if time.time() - call_start_time < MIN_CALL_SECS:
             return ""
-
-        logger.info(f"schedule_meeting invoked. Phone: {phone_number}, Date: {meeting_date}, Time: {meeting_time}")
+        logger.info(f"schedule_meeting: {meeting_date} {meeting_time}")
 
         try:
             start_dt, _ = parse_meeting_datetime(meeting_date, meeting_time)
             clean_date = start_dt.strftime("%Y-%m-%d")
             clean_time = start_dt.strftime("%H:%M:%S")
-        except Exception as e:
-            logger.warning(f"Failed to parse datetime for DB: {e}")
+        except Exception:
             clean_date, clean_time = meeting_date, meeting_time
 
-        def _bg_task():
-            # Auto-allocate a manager (round-robin)
-            manager = allocate_manager(project_name=project_name or None)
-            manager_name = manager["name"] if manager else None
-            manager_id = manager["id"] if manager else None
+        async def _bg():
+            errors = []
 
-            # Get caller name
-            caller_name = caller_name_override
-            if not caller_name and phone_number:
-                customer = lookup_customer_by_phone(phone_number)
-                if customer:
-                    caller_name = customer.get("name")
+            # 1. Allocate manager
+            try:
+                manager = await asyncio.to_thread(allocate_manager, project_name)
+            except Exception as e:
+                logger.error(f"schedule_meeting: allocate_manager failed: {e}")
+                manager = None
 
-            # Create meeting record
-            meeting_id = None
+            mgr_name = manager["name"] if manager else None
+            mgr_id   = manager["id"]   if manager else None
+
+            # Resolve caller name
+            c_name = caller_name_override
+            if not c_name and phone_number:
+                try:
+                    c = await asyncio.to_thread(lookup_customer_by_phone, phone_number)
+                    if c:
+                        c_name = c.get("name")
+                except Exception as e:
+                    logger.error(f"schedule_meeting: lookup_customer failed: {e}")
+
+            # 2. Save meeting to DB
+            mtg_id = None
             if phone_number:
                 try:
-                    meeting_id = create_meeting(
-                        phone_number=phone_number,
-                        contact_name=caller_name,
-                        contact_type=contact_type,
-                        meeting_type=meeting_type,
-                        meeting_date=clean_date,
-                        meeting_time=clean_time,
-                        location=location,
-                        project_name=project_name,
-                        manager_id=manager_id,
-                        manager_name=manager_name,
-                        call_log_id=call_log_id,
-                        notes=notes,
+                    mtg_id = await asyncio.to_thread(
+                        create_meeting,
+                        phone_number=phone_number, contact_name=c_name,
+                        contact_type=contact_type, meeting_type=meeting_type,
+                        meeting_date=clean_date, meeting_time=clean_time,
+                        location=location, project_name=project_name,
+                        manager_id=mgr_id, manager_name=mgr_name,
+                        call_log_id=call_log_id, notes=notes,
                     )
-                except Exception as db_err:
-                    logger.error(f"Error creating meeting in DB: {db_err}")
+                    if not mtg_id:
+                        errors.append("meeting DB record")
+                except Exception as e:
+                    logger.error(f"schedule_meeting: create_meeting failed: {e}")
+                    errors.append("meeting DB record")
 
-            # Update call log
+            # 3. Update call log
             if call_log_id:
                 try:
-                    update_call_log(
-                        call_log_id,
-                        next_action="site_visit" if meeting_type == "site_visit" else "meeting",
-                        manager_assigned=manager_name,
-                        notes=f"Meeting ({meeting_type}) scheduled: {clean_date} {clean_time}. Manager: {manager_name or 'TBD'}",
+                    await asyncio.to_thread(
+                        update_call_log, call_log_id,
+                        next_action="site_visit",
+                        manager_assigned=mgr_name,
+                        notes=f"Meeting: {clean_date} {clean_time} | {mgr_name or 'TBD'}",
                     )
-                except Exception as log_err:
-                    logger.error(f"Error updating call log: {log_err}")
+                except Exception as e:
+                    logger.error(f"schedule_meeting: update_call_log failed: {e}")
 
-            # ---- Google Calendar Integration ----
+            # 4. Create Google Calendar event
             try:
-                manager_email = get_manager_email(manager_id) if manager_id else None
-
-                cal_result = schedule_meeting_on_calendar(
-                    contact_name=caller_name or "Contact",
+                mgr_email = None
+                if mgr_id:
+                    mgr_email = await asyncio.to_thread(get_manager_email, mgr_id)
+                cal = await asyncio.to_thread(
+                    schedule_meeting_on_calendar,
+                    contact_name=c_name or "Contact",
                     contact_phone=phone_number or "",
-                    contact_type=contact_type,
-                    meeting_type=meeting_type,
-                    date_str=meeting_date,
-                    time_str=meeting_time,
-                    project_name=project_name,
-                    location=location,
-                    manager_name=manager_name or "",
-                    manager_email=manager_email or "",
+                    contact_type=contact_type, meeting_type=meeting_type,
+                    date_str=meeting_date, time_str=meeting_time,
+                    project_name=project_name, location=location,
+                    manager_name=mgr_name or "", manager_email=mgr_email or "",
                     notes=notes,
                 )
-
-                if cal_result["success"] and cal_result["event_id"]:
-                    if meeting_id:
-                        update_meeting_calendar(
-                            meeting_id,
-                            calendar_event_id=cal_result["event_id"],
-                            calendar_invite_sent=True,
-                        )
-                    logger.info(f"Calendar event created: {cal_result['event_id']}")
-                elif not cal_result["available"]:
-                    logger.warning(f"Calendar slot unavailable: {cal_result['message']}")
-                else:
-                    logger.warning(f"Calendar event creation failed: {cal_result['message']}")
+                if cal.get("success") and mtg_id:
+                    await asyncio.to_thread(update_meeting_calendar, mtg_id, cal["event_id"])
+                elif not cal.get("success"):
+                    errors.append("calendar invite")
+                    logger.error(f"schedule_meeting: calendar failed: {cal.get('error')}")
             except Exception as e:
-                logger.error(f"Error creating calendar event: {e}")
+                logger.error(f"schedule_meeting: schedule_meeting_on_calendar failed: {e}")
+                errors.append("calendar invite")
 
-        # Run heavily blocking DB/HTTP logic in background thread!
-        asyncio.create_task(asyncio.to_thread(_bg_task))
-        return "[SILENT] Done."
-        #
-        #         wa_result = send_and_log_meeting_details(
-        #             to_phone=phone_number,
-        #             contact_name=caller_name or "Customer",
-        #             meeting_type=meeting_type,
-        #             meeting_date=meeting_date,
-        #             meeting_time=meeting_time,
-        #             project_name=project_name,
-        #             location=location,
-        #             manager_name=manager_name or "",
-        #             manager_phone=manager_phone_num,
-        #             notes=notes,
-        #             meeting_id=meeting_id,
-        #             call_log_id=call_log_id,
-        #         )
-        #
-        #         if wa_result.get("success"):
-        #             whatsapp_msg = " Meeting details have been sent to WhatsApp."
-        #             logger.info(f"WhatsApp meeting confirmation sent to {phone_number}")
-        #         else:
-        #             whatsapp_msg = " WhatsApp message could not be sent, but meeting is saved."
-        #             logger.warning(f"WhatsApp send failed for {phone_number}: {wa_result.get('message')}")
-        # except Exception as e:
-        #     logger.error(f"Error sending WhatsApp meeting confirmation: {e}")
-        #     whatsapp_msg = " Meeting saved (WhatsApp notification pending)."
+            if errors:
+                logger.warning(
+                    f"schedule_meeting for {phone_number} completed with failures: {errors}. "
+                    f"meeting_id={mtg_id}, manager={mgr_name}"
+                )
 
-        # Return minimal silent response — agent must NOT read this aloud
+        asyncio.create_task(_bg())
         return "[SILENT] Done."
 
-
-
-    # ---- Create Agent Session ----
+    # ---- Session ----
     session = AgentSession(
         allow_interruptions=True,
-        min_interruption_duration=0.5,   # Need 500ms of speech to interrupt (avoids noise/cough triggers)
-        min_interruption_words=1,       # Must say at least 1 word to interrupt (not just sounds)
-        min_endpointing_delay=0.25,     # Quick response after user stops
-        max_endpointing_delay=0.8,      # Max 800ms wait for mid-sentence pauses
-        preemptive_generation=True,     # Re-enabled: Sweden Central is faster, preemptive helps!
-        aec_warmup_duration=0,          # Disable 3s initialization delay
-        tools=[schedule_callback, mark_as_dnc, schedule_meeting], # temporarily removed end_call, capture_outcome
+        min_interruption_duration=0.4,
+        min_interruption_words=1,
+        min_endpointing_delay=0.10,
+        max_endpointing_delay=0.6,
+        preemptive_generation=True,
+        tools=[end_call, capture_outcome, schedule_callback, mark_as_dnc, schedule_meeting],
     )
-
-    # ---- Track transcript ----
-    agent_start_time = time.time()
 
     @session.on("agent_speech_committed")
     def on_agent_speech(msg):
@@ -935,53 +870,18 @@ async def entrypoint(ctx: JobContext):
     def on_user_speech(msg):
         transcript_messages.append({"role": "user", "text": str(msg)})
 
-    # ---- Start Session ----
     voice_agent = VoiceAgent(
         instructions=agent_instructions,
         is_outbound=is_outbound,
         phone_number=phone_number,
         contact_type=contact_type,
     )
-    
-    await session.start(
-        agent=voice_agent,
-        room=ctx.room,
-    )
 
-    # ---- 4-Minute Auto-End Timer ----
-    async def _auto_end_timer():
-        """Hard cutoff: auto-end the call after MAX_CALL_DURATION."""
-        await asyncio.sleep(MAX_CALL_DURATION)
-        logger.info(f"Call limit of {MAX_CALL_DURATION}s reached. Force ending call.")
+    await session.start(agent=voice_agent, room=ctx.room)
 
-        # Save final call data
-        if call_log_id:
-            try:
-                transcript_text = "\n".join(
-                    [f"{m['role']}: {m['text']}" for m in transcript_messages]
-                )
-                update_call_log(
-                    call_log_id,
-                    disposition="max_duration",
-                    duration_seconds=MAX_CALL_DURATION,
-                    transcript=transcript_text,
-                    notes="Call auto-ended due to max duration",
-                )
-            except Exception as e:
-                logger.error(f"Error saving call data on auto-end: {e}")
-
-        try:
-            job_ctx = get_job_context()
-            await job_ctx.delete_room()
-            job_ctx.shutdown(reason="max_duration_reached")
-        except Exception as e:
-            logger.error(f"Error during auto-end: {e}")
-
-    asyncio.create_task(_auto_end_timer())
-
-    # ---- Outbound: Place the SIP call ----
+    # ---- Outbound: place SIP call ----
     if is_outbound and phone_number:
-        logger.info(f"Placing outbound call to: {phone_number}")
+        logger.info(f"Placing outbound call to {phone_number}...")
         lkapi = api.LiveKitAPI(
             url=os.getenv("LIVEKIT_URL"),
             api_key=os.getenv("LIVEKIT_API_KEY"),
@@ -997,35 +897,54 @@ async def entrypoint(ctx: JobContext):
                     wait_until_answered=True,
                 )
             )
-            logger.info("Call picked up successfully! Triggering agent greeting.")
-            if phone_number:
-                record_call_attempt(phone_number, result="answered", call_log_id=call_log_id)
-                
-            # Wait a brief moment for the audio track to stabilize, then greet!
-            async def trigger_greeting():
-                logger.info("Agent playing initial outbound greeting directly via TTS...")
-                c_name = caller_name if 'caller_name' in locals() and caller_name else "सर/मैडम"
+            logger.info("Call answered. Triggering greeting.")
+            record_call_attempt(phone_number, result="answered", call_log_id=call_log_id)
+
+            async def _greet():
+                await asyncio.sleep(0.5)
                 try:
-                    # Warm, casual greeting — like calling a friend
-                    await voice_agent.session.say(f"हेलो, {c_name} जी!", add_to_chat_ctx=True)
-                    await voice_agent.session.say("कैसे हैं आप? सब बढ़िया?", add_to_chat_ctx=True)
-                except AttributeError:
-                    # Fallback if say doesn't exist or isn't async
-                    import livekit.agents.llm as llm_model
-                    voice_agent.session.chat_ctx.messages.append(llm_model.ChatMessage(role="assistant", content=f"नमस्ते {c_name} जी, कैसे हैं आप?"))
+                    await voice_agent.session.say(
+                        f"नमस्ते {caller_name} जी, कैसे हैं आप?",
+                        add_to_chat_ctx=True,
+                    )
+                except Exception as e:
+                    logger.error(f"Greeting error: {e}")
                     await voice_agent.session.generate_reply()
-            asyncio.create_task(trigger_greeting())
-            
+
+            asyncio.create_task(_greet())
+
         except Exception as e:
-            logger.error(f"Error placing outbound call: {e}")
-            # Record failed attempt
-            if phone_number:
-                record_call_attempt(phone_number, result="failed", call_log_id=call_log_id)
+            logger.error(f"SIP call error: {e}")
+            record_call_attempt(phone_number, result="failed", call_log_id=call_log_id)
             if call_log_id:
-                update_call_log(call_log_id, disposition="failed", notes=f"Call failed: {e}")
+                update_call_log(call_log_id, disposition="failed", notes=str(e))
             ctx.shutdown()
         finally:
             await lkapi.aclose()
+
+    # ---- Auto-end timer ----
+    async def _auto_end():
+        await asyncio.sleep(MAX_CALL_DURATION)
+        logger.info("Max duration reached. Auto-ending.")
+        if call_log_id:
+            try:
+                update_call_log(
+                    call_log_id,
+                    disposition="max_duration",
+                    duration_seconds=MAX_CALL_DURATION,
+                    transcript="\n".join(f"{m['role']}: {m['text']}" for m in transcript_messages),
+                    notes="Auto-ended: max duration",
+                )
+            except Exception as e:
+                logger.error(f"auto-end log error: {e}")
+        try:
+            job_ctx = get_job_context()
+            await job_ctx.delete_room()
+            job_ctx.shutdown(reason="max_duration_reached")
+        except Exception as e:
+            logger.error(f"auto-end shutdown error: {e}")
+
+    asyncio.create_task(_auto_end())
 
 
 if __name__ == "__main__":

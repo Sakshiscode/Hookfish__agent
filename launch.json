@@ -1,0 +1,41 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Voice Agent (dev)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/voice_agent.py",
+      "args": ["dev"],
+      "console": "integratedTerminal",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    {
+      "name": "Trigger Test Call",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/call_trigger.py",
+      "args": ["buyer", "+917028425604", "--name", "  Sakshi"],
+      "console": "integratedTerminal",
+      "envFile": "${workspaceFolder}/.env"
+    },
+    {
+      "name": "Create DB Tables",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/create_agent_tables.py",
+      "console": "integratedTerminal",
+      "envFile": "${workspaceFolder}/.env"
+    },
+    {
+      "name": "Batch Campaign (dry run)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/batch_call_campaign.py",
+      "args": ["--dry-run", "--limit", "5"],
+      "console": "integratedTerminal",
+      "envFile": "${workspaceFolder}/.env"
+    }
+  ]
+}

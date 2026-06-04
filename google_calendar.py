@@ -12,11 +12,22 @@
 #   3. Share your Google Calendar with the service account email
 #      (the email looks like: xxx@project-id.iam.gserviceaccount.com)
 #   4. Set env vars: GOOGLE_CALENDAR_CREDENTIALS_FILE, GOOGLE_CALENDAR_ID
+#
+# Required env vars:
+#   GOOGLE_CALENDAR_CREDENTIALS_FILE  — absolute path to the service account JSON
+#   GOOGLE_CALENDAR_ID                — calendar ID (e.g. xxx@group.calendar.google.com)
+#
+# Optional env vars:
+#   GOOGLE_CALENDAR_ENABLED           — set to "false" to disable calendar entirely
+#                                       (agent runs, meetings saved to DB only)
+#   GOOGLE_CALENDAR_TIMEZONE          — default: Asia/Kolkata
+#   GOOGLE_CALENDAR_DEFAULT_DURATION  — default meeting duration in minutes (default: 60)
 # =========================================================================
 
 import os
 import logging
 import json
+import threading
 from datetime import datetime, timedelta
 from dateutil import parser as dateutil_parser
 from dateutil.relativedelta import relativedelta
@@ -35,61 +46,191 @@ logger = logging.getLogger("voice-agent-calendar")
 # Configuration
 # ============================================================
 
-# Path to the service account credentials JSON file
-CREDENTIALS_FILE = os.getenv(
-    "GOOGLE_CALENDAR_CREDENTIALS_FILE",
-    os.path.join(os.path.dirname(__file__), "google_credentials.json"),
-)
+# Set GOOGLE_CALENDAR_ENABLED=false to run without calendar (meetings saved to DB only)
+CALENDAR_ENABLED = os.getenv("GOOGLE_CALENDAR_ENABLED", "true").strip().lower() != "false"
 
-# The calendar ID to use (default: primary calendar of the service account)
-# For a shared calendar, this would be the calendar's email address
-CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary")
-
-# Timezone for events
-TIMEZONE = os.getenv("GOOGLE_CALENDAR_TIMEZONE", "Asia/Kolkata")
-
-# Default meeting duration in minutes
+CREDENTIALS_FILE = os.getenv("GOOGLE_CALENDAR_CREDENTIALS_FILE", "").strip()
+CALENDAR_ID      = os.getenv("GOOGLE_CALENDAR_ID", "").strip()
+TIMEZONE         = os.getenv("GOOGLE_CALENDAR_TIMEZONE", "Asia/Kolkata")
 DEFAULT_MEETING_DURATION = int(os.getenv("GOOGLE_CALENDAR_DEFAULT_DURATION", "60"))
-
-# Scopes required for calendar access
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
+
+# Required fields inside the service account JSON
+_REQUIRED_SA_FIELDS = ("type", "project_id", "private_key_id", "private_key", "client_email")
+
+
+# ============================================================
+# Startup validation
+# ============================================================
+
+class CalendarConfigError(RuntimeError):
+    """Raised at startup when calendar configuration is incomplete or invalid."""
+
+
+def validate_calendar_config() -> None:
+    """
+    Validate all calendar configuration at startup.
+
+    Raises CalendarConfigError with a precise, actionable message for each
+    problem found.  Call order matters — we stop at the first failure so the
+    operator gets one clear thing to fix at a time.
+
+    Does nothing if GOOGLE_CALENDAR_ENABLED=false.
+    """
+    if not CALENDAR_ENABLED:
+        logger.info("Google Calendar disabled via GOOGLE_CALENDAR_ENABLED=false. Skipping validation.")
+        return
+
+    errors = []
+
+    # ── 1. Credentials file path is set ──────────────────────────
+    if not CREDENTIALS_FILE:
+        errors.append(
+            "GOOGLE_CALENDAR_CREDENTIALS_FILE is not set.\n"
+            "  Fix: export GOOGLE_CALENDAR_CREDENTIALS_FILE=/absolute/path/to/service_account.json\n"
+            "  Or:  set GOOGLE_CALENDAR_ENABLED=false to run without calendar."
+        )
+
+    # ── 2. Credentials file exists on disk ───────────────────────
+    elif not os.path.isfile(CREDENTIALS_FILE):
+        errors.append(
+            f"GOOGLE_CALENDAR_CREDENTIALS_FILE points to a file that does not exist:\n"
+            f"  Path: {CREDENTIALS_FILE}\n"
+            f"  Fix: Download the service account JSON key from Google Cloud Console\n"
+            f"       and place it at the path above, or update the env var."
+        )
+
+    else:
+        # ── 3. File is valid JSON ─────────────────────────────────
+        try:
+            with open(CREDENTIALS_FILE) as f:
+                sa_data = json.load(f)
+        except json.JSONDecodeError as exc:
+            errors.append(
+                f"GOOGLE_CALENDAR_CREDENTIALS_FILE is not valid JSON:\n"
+                f"  Path:  {CREDENTIALS_FILE}\n"
+                f"  Error: {exc}\n"
+                f"  Fix:   Re-download the service account key from Google Cloud Console."
+            )
+            sa_data = {}
+
+        # ── 4. JSON contains required service-account fields ──────
+        if sa_data:
+            missing = [k for k in _REQUIRED_SA_FIELDS if not sa_data.get(k)]
+            if missing:
+                errors.append(
+                    f"Service account JSON is missing required fields: {missing}\n"
+                    f"  Path: {CREDENTIALS_FILE}\n"
+                    f"  Fix:  Re-download the service account key from Google Cloud Console."
+                )
+
+            # ── 5. File is actually a service account (not an OAuth client) ──
+            elif sa_data.get("type") != "service_account":
+                errors.append(
+                    f"GOOGLE_CALENDAR_CREDENTIALS_FILE contains a '{sa_data.get('type')}' credential.\n"
+                    f"  Expected: service_account\n"
+                    f"  Fix:  Go to Google Cloud Console → IAM & Admin → Service Accounts\n"
+                    f"        and download the JSON key for a service account, not an OAuth 2.0 client."
+                )
+
+    # ── 6. Calendar ID is set ─────────────────────────────────────
+    if not CALENDAR_ID:
+        errors.append(
+            "GOOGLE_CALENDAR_ID is not set.\n"
+            "  Fix: export GOOGLE_CALENDAR_ID=your-calendar@group.calendar.google.com\n"
+            "       Find it in Google Calendar → Settings → (your calendar) → Calendar ID.\n"
+            "  Note: Do NOT use 'primary' — the service account's primary calendar is\n"
+            "        not the shared Hookfish calendar."
+        )
+
+    # ── 7. Calendar ID looks like a real shared calendar ─────────
+    elif CALENDAR_ID == "primary":
+        errors.append(
+            "GOOGLE_CALENDAR_ID is set to 'primary'.\n"
+            "  The service account's primary calendar is NOT the shared company calendar.\n"
+            "  Fix: export GOOGLE_CALENDAR_ID=your-calendar@group.calendar.google.com\n"
+            "       Find it in Google Calendar → Settings → (your calendar) → Calendar ID."
+        )
+
+    if errors:
+        divider = "\n" + "─" * 60 + "\n"
+        message = divider.join(errors)
+        raise CalendarConfigError(
+            f"\n{'=' * 60}\n"
+            f"  Google Calendar configuration error(s) found at startup\n"
+            f"{'=' * 60}\n"
+            f"{message}\n"
+            f"{'=' * 60}"
+        )
+
+    logger.info(
+        f"Google Calendar config validated OK — "
+        f"calendar={CALENDAR_ID}, credentials={CREDENTIALS_FILE}"
+    )
 
 
 # ============================================================
 # Authentication
 # ============================================================
 
-_service = None  # Cached service instance
+_service = None
+_service_lock = threading.Lock()
+_config_validated = False
 
 
 def get_calendar_service():
     """
-    Authenticate using a Service Account and return the Google Calendar API service.
-    Caches the service instance for reuse.
+    Return a cached Google Calendar API service client.
+
+    Thread-safe via double-checked locking.
+    Runs validate_calendar_config() on first call so any config problem
+    surfaces immediately with a clear message rather than an obscure auth
+    failure mid-call.
+
+    Returns None if CALENDAR_ENABLED=false or if credentials are invalid
+    (error already logged).  Callers should treat None as "calendar
+    unavailable — save to DB only".
     """
-    global _service
+    global _service, _config_validated
+
+    if not CALENDAR_ENABLED:
+        return None
 
     if _service is not None:
         return _service
 
-    if not os.path.exists(CREDENTIALS_FILE):
-        logger.error(
-            f"Google Calendar credentials file not found: {CREDENTIALS_FILE}. "
-            f"Please download the service account JSON key and place it at this path, "
-            f"or set GOOGLE_CALENDAR_CREDENTIALS_FILE env var."
-        )
-        return None
+    with _service_lock:
+        if _service is not None:
+            return _service
 
-    try:
-        credentials = service_account.Credentials.from_service_account_file(
-            CREDENTIALS_FILE, scopes=SCOPES
-        )
-        _service = build("calendar", "v3", credentials=credentials)
-        logger.info("Google Calendar service initialized successfully.")
-        return _service
-    except Exception as e:
-        logger.error(f"Failed to initialize Google Calendar service: {e}")
-        return None
+        # Validate config once on first real use
+        if not _config_validated:
+            try:
+                validate_calendar_config()
+                _config_validated = True
+            except CalendarConfigError as exc:
+                # Log the full multi-line error so it's visible in the worker log
+                logger.error(str(exc))
+                return None
+
+        try:
+            credentials = service_account.Credentials.from_service_account_file(
+                CREDENTIALS_FILE, scopes=SCOPES
+            )
+            _service = build("calendar", "v3", credentials=credentials)
+            logger.info("Google Calendar service initialised successfully.")
+            return _service
+        except Exception as exc:
+            logger.error(
+                f"Failed to build Google Calendar service client.\n"
+                f"  Credentials: {CREDENTIALS_FILE}\n"
+                f"  Error:       {exc}\n"
+                f"  Common causes:\n"
+                f"    - Service account does not have the Calendar API enabled\n"
+                f"    - Calendar has not been shared with the service account email\n"
+                f"    - Private key in the JSON has been revoked"
+            )
+            return None
 
 
 # ============================================================
