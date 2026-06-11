@@ -4,7 +4,6 @@ import os
 import json
 import re
 import time
-
 from dotenv import load_dotenv
 
 # Load environment variables FIRST
@@ -138,19 +137,6 @@ VOICE & PERSONA:
   CORRECT: "मैं बोल रही हूँ", "मैं भेज दूँगी"
   WRONG: "मैं बोलता हूँ" (masculine — FORBIDDEN)
 
-  PERSONALITY & HUMAN EXPRESSIONS:
-- Use natural filler words: "हाँ", "अच्छा", "हम्म", "देखिए", "सुनिए", "actually", "basically"
-- React naturally to what caller says:
-  Positive news → "अरे वाह! बहुत अच्छा!"
-  They laugh → laugh back: "haha, जी बिल्कुल!"
-  They're busy → "ओह sorry, disturb कर दिया. बस एक minute?"
-  They agree → "हाँ जी, बिल्कुल सही बात है."
-  They're hesitant → "जी समझ सकती हूँ, कोई बात नहीं."
-  They ask good question → "अच्छा सवाल है!"
-- Speak in SHORT bursts (1-2 sentences max). Never lecture.
-- Pause naturally. Don't rush information.
-- Match their energy — if cheerful, be cheerful. If serious, be calm.
-
 LANGUAGE RULES:
 - Speak in natural Hindi (Devanagari script) mixed with English words.
 - NEVER use romanized Hindi. Always Devanagari for Hindi words.
@@ -166,13 +152,25 @@ PROPERTY FACTS (DO NOT HALLUCINATE):
 - If asked something not in the script: "ये detail मेरे पास अभी नहीं है. मैं confirm करके बताती हूँ."
 
 SITUATIONS:
+- NOT INTERESTED: "जी, कोई बात नहीं. अगर कभी future में property देखना हो तो call करिएगा. आपका शुक्रिया.." -> capture_outcome -> end_call
+- NOT INTERESTED:  Wait and end the call.Do not repeat similar things while ending the call.
+- BUYER SAYS "no thanks" / "nahi chahiye" / "interested nahi" -> acknowledge warmly -> capture_outcome -> end_call
 - DNC: "जी बिल्कुल, disturb नहीं करूँगी. Sorry for the inconvenience." → mark_as_dnc → end_call
 - WRONG NUMBER: "जी sorry, गलत number हो गया. माफ़ी चाहती हूँ." → end_call
 - BUSY: "जी कोई बात नहीं. कब convenient रहेगा?" → schedule_callback
 - SILENCE: "{caller_name} जी? Hello? सुन पा रहे हैं आप?"
 
+CALL ENDING RULES:
+- Wait and end the call.Do not repeat similar things while ending the call.
+- NEVER say "main call end kar deti hoon" or "call yahi end hogi" or any variation.
+- When ending: just say "जी, baat karke achha laga. Dhanyawad." and call end_call silently.
+- The caller should never know the call is about to end until you say goodbye.
+
 NAME USAGE: Address caller as "{caller_name} जी" throughout.
 TOOL RULES: Tools run silently. When tool returns "[SILENT] Done." say NOTHING about it.
+- NEVER narrate what you are about to do. Never say "main kahoongi ki..." or "call ends ho jaegi".
+- NEVER describe your own actions out loud.
+- Just DO the action naturally without announcing it.
 """
 
 # BUYER_SCRIPT_TEMPLATE — used when no DB script exists for the project.
@@ -198,7 +196,6 @@ BUYER_SCRIPT_TEMPLATE = """
    - Not interested → address concern briefly → capture_outcome → end_call
 --- END BUYER FLOW ---
 """
-
 BROKER_SCRIPT_TEMPLATE = """
 --- BROKER CALL FLOW ---
 
@@ -437,9 +434,8 @@ def build_agent_instructions(
             f"STRICT RULE: ONLY PITCH THIS PROJECT. Do not discuss any other project.\n"
         )
 
-    if db_context.strip():
+    if db_context.strip() and "No previous information" not in db_context:
         instructions += f"\n\n--- DATABASE CONTEXT ---\n{db_context.strip()}\n---\n"
-
     return instructions
 
 
@@ -450,35 +446,62 @@ def build_agent_instructions(
 class FilteredTTS(smallestai.TTS):
     """
     Strips LLM function-call artifacts before they reach the TTS engine.
-    Handles both Cerebras and Groq tool-call leak formats.
+
+    The LLM occasionally leaks internal tool-use text into the speech stream,
+    which sounds absurd to the caller. We apply three layers of defence:
+
+    1. Known-label strip  — removes any text starting from a recognisable
+       function-call keyword (covers the common case where the model names
+       its own tool or emits structured labels).
+    2. JSON block strip   — removes {...} or [...] blocks that survived the
+       first pass (raw JSON that the model sometimes emits as a preamble).
+    3. Bracket cleanup    — removes dangling parenthetical or square-bracket
+       fragments that contain no natural-language words (e.g. "(outcome:
+       interested)" leftover after the JSON was stripped).
+
+    If all text is stripped the TTS receives a single space so it doesn't
+    error on an empty string.
     """
 
+    # Recognisable tool/function labels — extended beyond the original set
+    
+
     _LABEL_PATTERN = re.compile(
-    r'(?i)('
-    # function only when followed by tool-call context
-    r'\bfunction[\s_]?(?:call|name|calls)\b[\s\S]*'
-    r'|\btool[\s_]?(?:use|call|name)\b[\s\S]*'
-    # specific tool names
-    r'|\bcapture[\s_]?outcome\b[\s\S]*'
-    r'|\bschedule[\s_]?(?:callback|meeting)\b[\s\S]*'
-    r'|\bmark[\s_]?(?:as[\s_]?)?dnc\b[\s\S]*'
-    # parameter labels
-    r'|\bparameters?[\s_]?outcome\b[\s\S]*'
-    r'|\boutcome[\s_]?reason\b[\s\S]*'
-    r'|\blead[\s_]?score\b[\s\S]*'
-    r'|\bnext[\s_]?action\b[\s\S]*'
-    r'|\binterest[\s_]?level\b[\s\S]*'
-    # XML tool tags
-    r'|<tool_call>[\s\S]*?</tool_call>'
-    r'|<function_calls>[\s\S]*'
-    r')',
-    re.DOTALL | re.IGNORECASE,
-)
+        r'(?i)('
+        r'|\bfunction\b[\s\S]*'
+        # 'function' followed by toolname or newline
+        r'\bfunction\b[\s]+(?:end_call|capture_outcome|schedule_callback|schedule_meeting|mark_as_dnc)[\s\S]*'
+        r'|\bfunction\b[\s]*[\n\r][\s\S]*'
+        r'|\bfunction\b\s*$'
+        # Tool names standalone
+        r'|\bend_call\b[\s\S]*'
+        r'|\bcapture_outcome\b[\s\S]*'
+        r'|\bschedule_callback\b[\s\S]*'
+        r'|\bschedule_meeting\b[\s\S]*'
+        r'|\bmark_as_dnc\b[\s\S]*'
+        # function call/name combos
+        r'|\bfunction[\s_]?(?:call|name|calls|arguments?)\b[\s\S]*'
+        r'|\btool[\s_]?(?:use|call|name)\b[\s\S]*'
+        # Parameter labels
+        r'|\boutcome[\s_]?reason\b[\s\S]*'
+        r'|\blead[\s_]?score\b[\s\S]*'
+        r'|\bnext[\s_]?action\b[\s\S]*'
+        r'|\binterest[\s_]?level\b[\s\S]*'
+        # XML and JSON
+        r'|<tool_call>[\s\S]*?</tool_call>'
+        r'|<function_calls>[\s\S]*'
+        r'|\"name\":\s*\"[a-z_]+\"[\s\S]*'
+        r'|\"arguments\":\s*\{[\s\S]*'
+        r')',
+        re.DOTALL | re.IGNORECASE | re.MULTILINE,
+    )
 
     _JSON_PATTERN = re.compile(r'[\[{][^)\]]*[\]}]', re.DOTALL)
     _BRACKET_JUNK = re.compile(r'[\(\[（【][^a-zA-Z\u0900-\u097F]{0,5}[\)\]）】]')
 
     def synthesize(self, text: str, **kwargs):
+        cleaned = text.replace('₹', '').replace('।', '.').strip()
+        cleaned = cleaned.replace('फंक्शन', '').replace('फ़ंक्शन', '')
         cleaned = self._LABEL_PATTERN.sub('', text).strip()
         cleaned = self._JSON_PATTERN.sub('', cleaned).strip()
         cleaned = self._BRACKET_JUNK.sub('', cleaned).strip()
@@ -504,14 +527,19 @@ class VoiceAgent(Agent):
                 interim_results=True,
                 smart_format=False,
             ),
-            llm=groq.LLM(
-                model="llama-3.3-70b-versatile",
+            #llm=groq.LLM(
+            #    model= "llama-3.3-70b-versatile",#"llama-3.1-8b-instant"    #"llama-3.3-70b-versatile",
+            #),
+            llm=openai.LLM(
+                model="gpt-4o-mini",
+                api_key=os.environ.get("AZURE_OPENAI_API_KEY"),
+                base_url="https://audiobot.services.ai.azure.com/openai/v1",
             ),
             tts=FilteredTTS(
                 model="lightning-v3.1",
                 voice_id="maithili",
-                language="hi", 
-                sample_rate=16000,
+                language="hi",
+                sample_rate=24000,
                 #base_url="https://api.smallest.ai/waves/v1",
             ),
             min_endpointing_delay=0.25,
@@ -657,11 +685,12 @@ async def entrypoint(ctx: JobContext):
     # ---- Transcript & timing ----
     transcript_messages = []
     call_start_time = time.time()
-    MIN_CALL_SECS = 20  # block tools for first 30s to prevent premature end
+    MIN_CALL_SECS = 30  # block tools for first 30s to prevent premature end
 
     # ---- Function Tools ----
 
-    @function_tool(name="end_call", description="End the call after capture_outcome. Use when user says goodbye.")
+    @function_tool(name="end_call", description= "End the call ONLY when caller explicitly says goodbye words: 'bye', 'goodbye', 'band karo', 'rakhna hai', 'phone rakhta hoon', 'alvida', 'dhanyawad bye'. 'Chalega', 'theek hai', 'ok', 'haan' are NOT goodbye — after site visit scheduled, ask 'Koi aur sawaal hai?' and wait. NEVER end just because site visit was scheduled."
+)
     async def end_call(reason: str = "call_completed") -> str:
         if time.time() - call_start_time < MIN_CALL_SECS:
             return ""
@@ -854,11 +883,12 @@ async def entrypoint(ctx: JobContext):
     # ---- Session ----
     session = AgentSession(
         allow_interruptions=True,
-        min_interruption_duration=0.4,
-        min_interruption_words=1,
-        min_endpointing_delay=0.10,
+        min_interruption_duration=0.8,
+        min_interruption_words=2,
+        min_endpointing_delay=0.1,
         max_endpointing_delay=0.6,
         preemptive_generation=True,
+        #chat_ctx_size=8,
         tools=[end_call, capture_outcome, schedule_callback, mark_as_dnc, schedule_meeting],
     )
 
