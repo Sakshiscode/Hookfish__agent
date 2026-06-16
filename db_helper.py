@@ -491,11 +491,11 @@ def check_call_allowed(phone: str) -> dict:
                 )
                 result = cur.fetchone()
 
-        if result and result["attempt_count"] >= 6:
+        if result and result["attempt_count"] >= 5:
             return {
                 "allowed": False,
                 "attempts_today": result["attempt_count"],
-                "reason": "Max 3 calls per day reached",
+                "reason": "Max 5 calls per day reached",
             }
 
         return {
